@@ -1,0 +1,108 @@
+/* ========================================
+   MessageBubble Component Styles
+   ======================================== */
+
+.message {
+    display: flex;
+    gap: var(--space-md);
+    padding: var(--space-lg) var(--space-xl);
+    animation: fadeIn 0.3s ease;
+}
+
+.message.user {
+    flex-direction: row-reverse;
+}
+
+.message-avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: var(--radius-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--text-lg);
+    flex-shrink: 0;
+}
+
+.message.user .message-avatar {
+    background: var(--bubble-user);
+}
+
+.message.assistant .message-avatar {
+    background: var(--bubble-ai);
+    border: 1px solid var(--surface-border);
+}
+
+.message-content {
+    max-width: 70%;
+    min-width: 100px;
+}
+
+.message.user .message-content {
+    text-align: right;
+}
+
+.message-bubble {
+    display: inline-block;
+    padding: var(--space-md) var(--space-lg);
+    border-radius: var(--radius-lg);
+    line-height: 1.6;
+    word-wrap: break-word;
+    white-space: pre-wrap;
+}
+
+.message.user .message-bubble {
+    background: var(--bubble-user);
+    color: white;
+    border-bottom-right-radius: var(--radius-sm);
+}
+
+.message.assistant .message-bubble {
+    background: var(--bubble-ai);
+    color: var(--text-primary);
+    border-bottom-left-radius: var(--radius-sm);
+    border: 1px solid var(--surface-border);
+}
+
+.message.system .message-bubble {
+    background: rgba(255, 200, 100, 0.1);
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    border: 1px solid rgba(255, 200, 100, 0.2);
+}
+
+/* 流式打字效果 */
+.message.streaming .message-bubble::after {
+    content: '▋';
+    animation: pulse 1s infinite;
+    margin-left: 2px;
+    color: var(--primary);
+}
+
+.message-time {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    margin-top: var(--space-xs);
+}
+
+/* 代码块样式 */
+.message-bubble code {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+}
+
+.message-bubble pre {
+    background: rgba(0, 0, 0, 0.3);
+    padding: var(--space-md);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+    margin: var(--space-sm) 0;
+}
+
+.message-bubble pre code {
+    background: none;
+    padding: 0;
+}
