@@ -267,6 +267,10 @@ class ChatHistoryManager:
             chars_per_token=ctx_cfg.get("chars_per_token", 2.5),
             reserve_tokens=ctx_cfg.get("reserve_tokens", 512)
         )
+        # 增量摘要配置
+        self.SUMMARIZE_THRESHOLD = ctx_cfg.get("summarize_threshold", 20)  # 超过此消息数触发摘要
+        self.KEEP_RECENT = ctx_cfg.get("keep_recent", 10)                  # 摘要后保留的最近消息条数
+        self._summarizing_sessions: set = set()                            # 防止并发重复摘要
         
         # 5. 启动后台落库线程
         self.running = True
@@ -333,6 +337,17 @@ class ChatHistoryManager:
                     _, data_json = raw_msg
                     data = json.loads(data_json)
                     self._persist_message(data)
+                    # Redis 路径：消息落库后检查摘要触发（仅 AI 回复时）
+                    sid = data.get('session_id', '')
+                    if data.get('role') == 'assistant' and self.llm and sid not in self._summarizing_sessions:
+                        if self._should_summarize(sid):
+                            self._summarizing_sessions.add(sid)
+                            threading.Thread(
+                                target=self._run_summarize_with_cleanup,
+                                args=(sid,),
+                                daemon=True,
+                                name=f"Summarize-{sid[:8]}"
+                            ).start()
             except Exception as e:
                 print(f"⚠️ [Sync] 后台落库错误: {e}")
                 time.sleep(1)
@@ -361,6 +376,7 @@ class ChatHistoryManager:
         
         if self.use_redis and self.redis:
             try:
+                # 这是写入序列化+中文优化
                 self.redis.lpush(self.BUFFER_KEY, json.dumps(msg_data, ensure_ascii=False))
                 return
             except Exception as e:
@@ -368,6 +384,16 @@ class ChatHistoryManager:
         
         # 降级直接写 MySQL
         self._persist_message(msg_data)
+        # 直写路径：消息落库后检查摘要触发（仅 AI 回复时）
+        if role == 'assistant' and self.llm and session_id not in self._summarizing_sessions:
+            if self._should_summarize(session_id):
+                self._summarizing_sessions.add(session_id)
+                threading.Thread(
+                    target=self._run_summarize_with_cleanup,
+                    args=(session_id,),
+                    daemon=True,
+                    name=f"Summarize-{session_id[:8]}"
+                ).start()
     
     def get_history_str(
         self, 
@@ -377,31 +403,190 @@ class ChatHistoryManager:
         current_query: str = ""
     ) -> str:
         """
-        获取上下文字符串（经过智能截断）
+        获取上下文字符串（融合摘要 + 最近消息，经过智能截断）
+        
+        策略：
+          1. 先查询 session_summaries 是否存在历史摘要
+          2. 若有摘要，仅从 summarized_until 之后加载最近 KEEP_RECENT 条消息
+          3. 将"【历史对话摘要】"前缀 + 近期消息共同喂给 ContextWindowManager
         
         Args:
             session_id: 会话 ID
-            limit: 从数据库获取的最大消息数
+            limit: 无摘要时从数据库获取的最大消息数
             system_prompt: 系统提示词（用于 token 计算）
             current_query: 当前查询（用于 token 计算）
         
         Returns:
-            截断后的历史对话字符串
+            截断后的历史对话字符串（可能包含摘要前缀）
         """
         with self.db_pool.get_connection() as conn:
             with conn.cursor() as cursor:
+                # 1. 查询摘要
                 cursor.execute(
-                    """SELECT role, content FROM messages 
-                       WHERE session_id = %s 
-                       ORDER BY created_at ASC 
-                       LIMIT %s""",
-                    (session_id, limit)
+                    "SELECT summary, summarized_until FROM session_summaries WHERE session_id = %s",
+                    (session_id,)
                 )
+                summary_row = cursor.fetchone()
+
+                # 2. 按摘要状态加载消息
+                if summary_row and summary_row.get('summarized_until'):
+                    # 只加载摘要时间点之后的最近消息
+                    cursor.execute(
+                        """SELECT role, content FROM messages 
+                           WHERE session_id = %s AND created_at > %s
+                           ORDER BY created_at ASC LIMIT %s""",
+                        (session_id, summary_row['summarized_until'], self.KEEP_RECENT)
+                    )
+                else:
+                    cursor.execute(
+                        """SELECT role, content FROM messages 
+                           WHERE session_id = %s 
+                           ORDER BY created_at ASC LIMIT %s""",
+                        (session_id, limit)
+                    )
                 rows = cursor.fetchall()
                 messages = [(r['role'], r['content']) for r in rows]
-        
-        return self.context_manager.manage_context(messages, system_prompt, current_query)
+
+        # 3. 近期消息经智能截断
+        history_str = self.context_manager.manage_context(messages, system_prompt, current_query)
+
+        # 4. 若存在摘要，拼接"历史背景"前缀
+        if summary_row and summary_row.get('summary'):
+            if history_str:
+                return f"【历史对话摘要】\n{summary_row['summary']}\n\n【近期对话】\n{history_str}"
+            return f"【历史对话摘要】\n{summary_row['summary']}"
+
+        return history_str
     
+    def _should_summarize(self, session_id: str) -> bool:
+        """
+        判断是否需要触发摘要。
+
+        触发条件：消息总数超过 SUMMARIZE_THRESHOLD 且未摘要的消息
+        数量超过 KEEP_RECENT + 5（5 条缓冲，避免过于频繁重触发）。
+        """
+        try:
+            with self.db_pool.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT COUNT(*) as cnt FROM messages WHERE session_id = %s",
+                        (session_id,)
+                    )
+                    total = cursor.fetchone()['cnt']
+
+                    if total <= self.SUMMARIZE_THRESHOLD:
+                        return False
+
+                    cursor.execute(
+                        "SELECT summarized_until FROM session_summaries WHERE session_id = %s",
+                        (session_id,)
+                    )
+                    row = cursor.fetchone()
+                    if row and row.get('summarized_until'):
+                        cursor.execute(
+                            """SELECT COUNT(*) as cnt FROM messages
+                               WHERE session_id = %s AND created_at > %s""",
+                            (session_id, row['summarized_until'])
+                        )
+                        unsummarized = cursor.fetchone()['cnt']
+                        return unsummarized > self.KEEP_RECENT + 5
+
+                    return True  # 无摘要但总数超阈值
+        except Exception:
+            return False
+
+    def _run_summarize_with_cleanup(self, session_id: str):
+        """包装方法：摘要完成或失败后，从进行中集合里移除会话 ID，防止永久锁定。"""
+        try:
+            self._async_summarize_old_messages(session_id)
+        finally:
+            self._summarizing_sessions.discard(session_id)
+
+    def _async_summarize_old_messages(self, session_id: str):
+        """
+        后台异步增量摘要：将旧对话压缩，UPSERT 写入 session_summaries 表。
+
+        策略：
+          - 读取 [上次摘要截止点, 总消息-KEEP_RECENT] 范围内的消息进行压缩
+          - 若已有摘要则合并（Incremental），否则全量摘要
+          - 采用 ON DUPLICATE KEY UPDATE 幂等写入，不产生重复记录
+        """
+        try:
+            with self.db_pool.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # 1. 读取现有摘要信息
+                    cursor.execute(
+                        "SELECT summary, summarized_until FROM session_summaries WHERE session_id = %s",
+                        (session_id,)
+                    )
+                    existing = cursor.fetchone()
+                    old_summary = existing['summary'] if existing else None
+                    last_summarized = existing['summarized_until'] if existing else None
+
+                    # 2. 加载所有待摘要候选消息（上次截止点之后）
+                    if last_summarized:
+                        cursor.execute(
+                            """SELECT role, content, created_at FROM messages
+                               WHERE session_id = %s AND created_at > %s
+                               ORDER BY created_at ASC""",
+                            (session_id, last_summarized)
+                        )
+                    else:
+                        cursor.execute(
+                            """SELECT role, content, created_at FROM messages
+                               WHERE session_id = %s
+                               ORDER BY created_at ASC""",
+                            (session_id,)
+                        )
+                    all_eligible = cursor.fetchall()
+
+            # 保留最近 KEEP_RECENT 条不摘要，其余全部压缩
+            msgs_to_summarize = all_eligible[:-self.KEEP_RECENT] if len(all_eligible) > self.KEEP_RECENT else []
+            if not msgs_to_summarize:
+                print(f"ℹ️ [Summary] 会话 {session_id[:8]}... 无足够旧消息，跳过摘要")
+                return
+
+            new_summarized_until = msgs_to_summarize[-1]['created_at']
+            history_text = "\n".join([f"{m['role']}: {m['content']}" for m in msgs_to_summarize])
+
+            # 3. 构建 LLM Prompt（增量合并 or 全量）
+            if old_summary:
+                prompt_text = (
+                    f"你是一个对话摘要助手。以下是该对话已有的历史摘要:\n"
+                    f"【已有摘要】\n{old_summary}\n\n"
+                    f"以下是追加的新对话内容:\n{history_text}\n\n"
+                    f"请将以上内容合并，生成一段不超过300字的完整摘要，保留关键意图与结论:\n摘要："
+                )
+            else:
+                prompt_text = (
+                    f"你是一个对话摘要助手。请将以下对话记录压缩成不超过300字的摘要，保留关键信息和结论:\n"
+                    f"{history_text}\n\n摘要："
+                )
+
+            # 4. 调用 LLM
+            chain = PromptTemplate.from_template("{text}") | self.llm | StrOutputParser()
+            new_summary = chain.invoke({"text": prompt_text}).strip()
+
+            if len(new_summary) > 500:
+                new_summary = new_summary[:500] + "..."
+
+            # 5. UPSERT 写入 session_summaries（幂等）
+            with self.db_pool.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """INSERT INTO session_summaries (session_id, summary, summarized_until)
+                           VALUES (%s, %s, %s)
+                           ON DUPLICATE KEY UPDATE
+                               summary = VALUES(summary),
+                               summarized_until = VALUES(summarized_until)""",
+                        (session_id, new_summary, new_summarized_until)
+                    )
+
+            print(f"✅ [Summary] 会话 {session_id[:8]}... 摘要已更新，截至: {new_summarized_until}")
+
+        except Exception as e:
+            print(f"⚠️ [Summary] 会话 {session_id[:8]}... 摘要生成失败: {e}")
+
     def get_or_create_session(
         self, 
         user_id: str, 
