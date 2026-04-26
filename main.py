@@ -142,6 +142,17 @@ async def health_check():
     }
 
 
+@app.get("/metrics", summary="系统运行指标")
+async def system_metrics():
+    """
+    暴露熔断器状态、语义缓存命中率等运行时指标。
+    可对接 Prometheus/Grafana 监控。
+    """
+    if agent_service:
+        return agent_service.get_system_metrics()
+    return {"error": "service not initialized"}
+
+
 # ==================== 入口 ====================
 
 if __name__ == "__main__":

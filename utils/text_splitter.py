@@ -3,7 +3,7 @@
 文本分词工具
 """
 from typing import List
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 def create_text_splitter(
@@ -27,7 +27,10 @@ def create_text_splitter(
     """
     configs = {
         "legal": {
+            # 大多数法律条款（如《刑法》、《劳动法》）的单条长度通常在 100~300 字之间。
+            # 设定为 600，意味着一个 Chunk 大概率能包含 1 到 2 个完整的法律条款。
             "chunk_size": 600,
+            # 通常 Overlap 设置为 Size 的 10% ~ 20% 是业界最佳实践
             "chunk_overlap": 80,
             "separators": [
                 "\n\n",      # 段落
@@ -41,6 +44,7 @@ def create_text_splitter(
             ]
         },
         "contract": {
+            # 高密度信息：合同通常比法律条文更“碎”。比如“甲方责任”下面可能有10条细则，每一条都在描述一个具体的义务（付款、交付、保密）
             "chunk_size": 400,
             "chunk_overlap": 60,
             "separators": [
@@ -55,6 +59,7 @@ def create_text_splitter(
             ]
         },
         "general": {
+            # 通用的情况
             "chunk_size": 500,
             "chunk_overlap": 50,
             "separators": ["\n\n", "\n", "。", "！", "？", " ", ""]

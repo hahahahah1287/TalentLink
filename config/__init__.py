@@ -8,7 +8,6 @@ TalentLink 应用配置模块
 - 数据库连接配置
 - 上下文窗口参数
 """
-import os
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
 
@@ -17,7 +16,7 @@ from typing import Dict, Any, Optional
 class LLMConfig:
     """大语言模型配置"""
     # GGUF 模型路径
-    model_path: str = "./qwen2.5-7b-instruct-q5_k_m-00001-of-00002.gguf"
+    model_path: str = "./Qwen3.5-9B-Q5_K_M.gguf"
     # 上下文窗口
     n_ctx: int = 4096
     # GPU 层数 (-1 表示全部卸载到 GPU)
@@ -26,9 +25,6 @@ class LLMConfig:
     # 参数
     temperature: float = 0.1
     verbose: bool = False
-
-
-import torch
 
 @dataclass
 class EmbeddingConfig:
