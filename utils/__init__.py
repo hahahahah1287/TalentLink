@@ -21,6 +21,7 @@ from .semantic_cache import SemanticCache
 from .guardrails import GuardrailsPipeline
 from .legal_parser import parse_legal_document
 from .metadata_annotator import annotate_documents
+from .retrieval_service import RetrievalService
 
 __all__ = [
     "RerankService",
@@ -32,4 +33,5 @@ __all__ = [
     "GuardrailsPipeline",
     "parse_legal_document",
     "annotate_documents",
+    "RetrievalService",
 ]

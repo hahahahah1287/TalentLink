@@ -1,0 +1,122 @@
+# -*- coding: utf-8 -*-
+"""
+统一检索服务
+
+封装 HyDE 查询改写 + BM25/FAISS 混合检索 + Cross-Encoder Rerank，
+消除 contract chain 和 ReAct agent 之间的检索代码重复。
+
+使用方式：
+    # 作为检索管线（contract 路径，带 HyDE）
+    service = RetrievalService(retriever, reranker, query_rewriter)
+    law_ctx = service.retrieve_as_string(query, use_hyde=True)
+
+    # 作为 LangChain Tool（ReAct agent 路径，不带 HyDE）
+    tool = service.as_tool()
+    agent = create_react_agent(llm, [tool, ...], prompt)
+"""
+from typing import List, Optional
+from langchain.tools import tool
+from langchain_core.documents import Document
+
+
+class RetrievalService:
+    """
+    统一检索服务
+
+    将 HyDE 改写、混合检索、Rerank 封装为单一入口，
+    同时支持管线模式（直接调用）和工具模式（as_tool 给 agent 用）。
+    """
+
+    def __init__(
+        self,
+        retriever,           # EnsembleRetriever 实例
+        reranker=None,       # RerankService 实例，可选
+        query_rewriter=None, # QueryRewriter 实例，可选
+        top_k: int = 3,
+        rerank_enabled: bool = True,
+    ):
+        self.retriever = retriever
+        self.reranker = reranker
+        self.query_rewriter = query_rewriter
+        self.top_k = top_k
+        self.rerank_enabled = rerank_enabled
+
+    def retrieve(self, query: str, use_hyde: bool = False) -> List[Document]:
+        """
+        统一检索入口
+
+        Args:
+            query: 用户查询
+            use_hyde: 是否启用 HyDE 查询改写（contract 路径用 True，agent tool 用 False）
+
+        Returns:
+            检索并重排序后的文档列表
+        """
+        # 1. 可选 HyDE 改写
+        effective_query = query
+        if use_hyde and self.query_rewriter:
+            try:
+                effective_query = self.query_rewriter.hyde_rewrite(query)
+                print(f"📝 [RetrievalService] HyDE 改写完成，增强查询长度: {len(effective_query)} 字符")
+            except Exception as e:
+                print(f"⚠️ [RetrievalService] HyDE 改写失败，使用原始查询: {e}")
+                effective_query = query
+
+        # 2. 混合检索 (BM25 + FAISS)
+        raw_docs = self.retriever.get_relevant_documents(effective_query)
+
+        if not raw_docs:
+            return []
+
+        # 3. Cross-Encoder Rerank
+        if self.rerank_enabled and self.reranker is not None:
+            reranked_docs = self.reranker.rerank(query, raw_docs, top_k=self.top_k)
+            return reranked_docs
+
+        return raw_docs[: self.top_k]
+
+    def retrieve_as_string(
+        self, query: str, use_hyde: bool = False, separator: str = "\n\n"
+    ) -> str:
+        """
+        检索并返回拼接后的文本
+
+        Args:
+            query: 用户查询
+            use_hyde: 是否启用 HyDE
+            separator: 文档之间的分隔符
+
+        Returns:
+            拼接的文档内容字符串
+        """
+        docs = self.retrieve(query, use_hyde=use_hyde)
+        if not docs:
+            return "未找到相关内容。"
+        return separator.join(doc.page_content for doc in docs)
+
+    def as_tool(self):
+        """
+        将检索能力封装为 LangChain Tool（供 ReAct agent 使用）
+
+        agent 的 Thought 步骤替代 HyDE 做查询改写，因此 use_hyde=False。
+
+        Returns:
+            LangChain Tool 对象
+        """
+        service = self
+
+        @tool
+        def local_knowledge_search(query: str) -> str:
+            """
+            本地知识库搜索工具。用于查询已存储的法律法规、合同模板等历史数据。
+            适合查询：劳动法、合同法、公司已有的法律文档等。
+
+            Args:
+                query: 查询内容
+
+            Returns:
+                相关文档内容
+            """
+            return service.retrieve_as_string(query, use_hyde=False)
+
+        return local_knowledge_search

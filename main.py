@@ -35,7 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 
-from services import UnifiedAgentService
+from workflow_service import WorkflowService
 
 
 # ==================== 数据模型 ====================
@@ -45,6 +45,7 @@ class ChatRequest(BaseModel):
     user_id: str
     session_id: Optional[str] = None  # 新对话传 None
     query: str
+    scene: str = "chat"               # "contract" / "job" / "chat"
     contract_text: Optional[str] = None  # 仅审合同时需要
 
 
@@ -55,7 +56,7 @@ class HistoryResponse(BaseModel):
 
 # ==================== 全局服务 ====================
 
-agent_service: Optional[UnifiedAgentService] = None
+workflow_service: Optional[WorkflowService] = None
 
 
 # ==================== 生命周期管理 ====================
@@ -64,22 +65,22 @@ agent_service: Optional[UnifiedAgentService] = None
 async def lifespan(app: FastAPI):
     """
     应用生命周期管理
-    
+
     - 启动时：初始化服务
     - 关闭时：优雅关闭（确保数据落库）
     """
-    global agent_service
-    
+    global workflow_service
+
     # 启动
     print("🚀 [App] 正在初始化服务...")
-    agent_service = UnifiedAgentService()
+    workflow_service = WorkflowService()
     print("✅ [App] 服务已就绪")
-    
+
     yield
-    
+
     # 关闭
-    if agent_service:
-        agent_service.shutdown()
+    if workflow_service:
+        workflow_service.shutdown()
 
 
 # ==================== FastAPI 应用 ====================
@@ -107,15 +108,21 @@ app.add_middleware(
 async def chat_stream(req: ChatRequest):
     """
     主对话接口
-    
+
+    scene 参数决定走哪个 workflow：
+    - "contract" → 合同审查图
+    - "job"      → 研究型任务图（Planner 自动规划工具）
+    - "chat"     → 直接 LLM 对话
+
     客户端应使用 EventSource 或 fetch 读取 SSE 流。
     """
     return StreamingResponse(
-        agent_service.process_request_stream(
-            req.user_id,
-            req.session_id,
-            req.query,
-            req.contract_text
+        workflow_service.process_request_stream(
+            user_id=req.user_id,
+            session_id=req.session_id,
+            query=req.query,
+            scene=req.scene,
+            contract_text=req.contract_text,
         ),
         media_type="text/event-stream"
     )
@@ -124,7 +131,7 @@ async def chat_stream(req: ChatRequest):
 @app.get("/history/{user_id}", response_model=HistoryResponse, summary="获取会话历史")
 async def get_history(user_id: str):
     """获取用户的会话列表（用于侧边栏）"""
-    sessions = agent_service.history_manager.get_user_sessions(user_id)
+    sessions = workflow_service.history_manager.get_user_sessions(user_id)
     return HistoryResponse(sessions=sessions)
 
 
@@ -135,9 +142,9 @@ async def health_check():
         "status": "ok",
         "service": "TalentLink AI",
         "components": {
-            "llm": agent_service is not None,
-            "database": agent_service.history_manager.db_pool is not None if agent_service else False,
-            "redis": agent_service.history_manager.use_redis if agent_service else False,
+            "llm": workflow_service is not None,
+            "database": workflow_service.history_manager.db_pool is not None if workflow_service else False,
+            "redis": workflow_service.history_manager.use_redis if workflow_service else False,
         }
     }
 
@@ -148,8 +155,8 @@ async def system_metrics():
     暴露熔断器状态、语义缓存命中率等运行时指标。
     可对接 Prometheus/Grafana 监控。
     """
-    if agent_service:
-        return agent_service.get_system_metrics()
+    if workflow_service:
+        return workflow_service.get_system_metrics()
     return {"error": "service not initialized"}
 
 
