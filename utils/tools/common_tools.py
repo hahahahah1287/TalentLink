@@ -26,15 +26,20 @@ def policy_check(
     result = guardrails.run(response, context=context or {})
 
     policy_flags = []
+    citation_issues = []
     if result["modified"]:
         for guard_info in result.get("guards_triggered", []):
-            policy_flags.append(guard_info.get("guard", "unknown"))
+            guard_name = guard_info.get("guard", "unknown")
+            policy_flags.append(guard_name)
+            if guard_name == "引用验证":
+                citation_issues.append(guard_info.get("details", ""))
 
     return {
         "output": result["output"],
         "modified": result["modified"],
         "guards_triggered": result.get("guards_triggered", []),
         "policy_flags": policy_flags,
+        "citation_issues": citation_issues,
     }
 
 

@@ -57,3 +57,5 @@ class AppState(TypedDict, total=False):
     # === 合规 ===
     policy_flags: List[str]
     status: str             # "running" | "done" | "error"
+    citation_retry: int     # 引用验证重试次数（0=未重试, 1=已重试一次）
+    citation_issues: List[str]  # 引用验证发现的问题（用于剥离）
