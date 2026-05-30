@@ -37,7 +37,6 @@ from utils import (
     CircuitBreakerOpenError,
     QueryRewriter,
     SemanticCache,
-    GuardrailsPipeline,
     RetrievalService,
     parse_legal_document,
     annotate_documents,
@@ -97,6 +96,8 @@ class WorkflowService:
             query_rewriter=self.query_rewriter,
             top_k=self.config.reranker.top_k,
             rerank_enabled=self.config.retrieval.rerank_enabled,
+            score_threshold=self.config.reranker.score_threshold,
+            hyde_enabled=self.config.retrieval.hyde_enabled,
         )
 
         # --- 6. 初始化历史管理器 ---
@@ -125,10 +126,7 @@ class WorkflowService:
             context_config=context_config,
         )
 
-        # --- 7. 初始化 Guardrails ---
-        self.guardrails = GuardrailsPipeline()
-
-        # --- 8. 初始化安全检测器 ---
+        # --- 7. 初始化安全检测器 ---
         from services import PromptInjectionDetector
         self.injection_detector = PromptInjectionDetector(
             llm=self.llm, enable_llm_detection=True
@@ -148,16 +146,11 @@ class WorkflowService:
         self.contract_graph = create_contract_review_graph(
             llm=self.llm,
             retrieval_service=self.retrieval_service,
-            guardrails=self.guardrails,
         )
         self.research_graph = create_research_agent_graph(
             llm=self.llm,
             retrieval_service=self.retrieval_service,
-            guardrails=self.guardrails,
         )
-
-        # --- 11. 创建通用对话链 ---
-        self.general_chain = self._create_general_chain()
 
         print("✅ [WorkflowService] 所有组件初始化完成")
 
@@ -204,20 +197,6 @@ class WorkflowService:
             weights=[self.config.retrieval.bm25_weight, self.config.retrieval.faiss_weight],
         )
 
-    def _create_general_chain(self):
-        """创建通用对话链"""
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "你是一个有用、友好的 AI 助手。请简洁、准确地回答用户问题。"),
-            ("user", """
-【历史对话】
-{history}
-
-【用户新问题】
-{query}
-
-请回答：""")
-        ])
-        return prompt | self.llm | StrOutputParser()
 
     async def process_request_stream(
         self,
@@ -231,15 +210,14 @@ class WorkflowService:
         流式处理用户请求
 
         根据 scene 参数路由到不同 workflow：
-        - "contract" → 合同审查图
-        - "job"      → 求职推荐图
-        - 其他       → 直接 LLM 对话
+        - "contract" → 合同审查图（直接 RAG 链路）
+        - 其他       → 研究型 Agent（Planner 自动规划工具）
 
         Args:
             user_id: 用户 ID
             session_id: 会话 ID（新对话传 None）
             query: 用户查询
-            scene: 业务场景 ("contract" | "job" | "chat")
+            scene: 业务场景 ("contract" | 其他)
             contract_text: 合同文本（仅 contract 场景需要）
 
         Yields:
@@ -289,6 +267,9 @@ class WorkflowService:
             "search_results": [],
             "policy_flags": [],
             "status": "running",
+            "review_status": "approve",
+            "review_issues": [],
+            "review_retry": 0,
         }
 
         # 7. 根据 scene 路由到对应 workflow
@@ -298,43 +279,20 @@ class WorkflowService:
                 yield "data: [正在进行合同审查（检索法律条文 → 对比分析 → 合规检查）...]\n\n"
                 result = await self.contract_graph.ainvoke(initial_state)
                 full_response = result.get("final_answer", "")
-
-            elif scene == "job":
+            else:
                 yield "data: [正在为您搜索相关信息...]\n\n"
                 result = await self.research_graph.ainvoke(initial_state)
                 full_response = result.get("final_answer", "")
 
-            else:  # chat — 不进 LangGraph，直接 LLM
-                async for chunk in self.general_chain.astream({
-                    "history": history_str,
-                    "query": query,
-                }):
-                    full_response += chunk
-                    yield f"data: {chunk}\n\n"
-
-            # 对于 workflow 场景，一次性输出结果
-            if scene in ("contract", "job"):
-                yield f"data: {full_response}\n\n"
+            yield f"data: {full_response}\n\n"
 
         except Exception as e:
             full_response = f"系统内部错误: {str(e)}"
             print(traceback.format_exc())
             yield f"data: {full_response}\n\n"
 
-        # 8. Guardrails（chat 场景已有的 guardrails 逻辑）
-        if scene not in ("contract", "job"):
-            # workflow 场景已在图内做 policy_check，这里只处理 chat
-            guardrails_result = self.guardrails.run(
-                full_response, context={"intent": scene}
-            )
-            full_response = guardrails_result["output"]
-            if guardrails_result["modified"]:
-                for guard_info in guardrails_result["guards_triggered"]:
-                    if guard_info["guard"] == "免责声明":
-                        yield f"data: {self.guardrails.guards[-1].DISCLAIMER}\n\n"
-
-        # 9. 写入语义缓存
-        if scene != "chat" and len(full_response) > 50:
+        # 8. 写入语义缓存
+        if len(full_response) > 50:
             self.semantic_cache.put(query, full_response)
 
         # 10. 存档

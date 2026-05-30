@@ -3,7 +3,7 @@
 研究型任务 LangGraph Workflow
 
 通用的研究型任务图，不限于求职。Planner 根据用户问题自动决定使用哪些工具：
-  plan → execute (循环) → synthesize → policy_check
+  plan → execute (循环) → synthesize → review (Review Agent)
 
 适用场景：
 - "对比旧法律和新法律的区别" → legal_search + web_search
@@ -13,10 +13,8 @@
 Planner 使用硬编码 JSON 解析 + fallback，适配 9B 小模型。
 """
 import json
-import re
 import time
 from typing import Dict, Any, List
-from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -25,7 +23,7 @@ from utils.state import AppState
 from utils.retrieval_service import RetrievalService
 from utils.tools.job_tools import web_search, job_search
 from utils.tools.contract_tools import create_synthesis_chain
-from utils.tools.common_tools import policy_check
+from workflows.review_agent import create_review_agent_node, check_review_result
 
 
 # ==================== 硬编码 fallback 计划 ====================
@@ -115,7 +113,7 @@ def make_execute_node(retrieval_service: RetrievalService):
 
         result = ""
         if step_name == "legal_search":
-            result = retrieval_service.retrieve_as_string(query, use_hyde=False)
+            result = retrieval_service.retrieve_as_string(query)
             updates = {
                 "law_context": result,
                 "current_step": current_step + 1,
@@ -192,67 +190,6 @@ def make_synthesize_node(llm):
     return synthesize
 
 
-def make_policy_check_node(guardrails):
-    """创建策略检查节点
-
-    引用验证失败时的路由逻辑：
-    - citation_retry == 0 → status="citation_retry" → 走 re_synthesize
-    - citation_retry >= 1 → status="strip" → 走 strip_citations
-    - 无引用问题 → status="done"
-    """
-
-    def check(state: AppState) -> Dict[str, Any]:
-        print(f"🛡️ [ResearchAgent:policy_check] 合规检查中...")
-
-        result = policy_check(
-            response=state.get("final_answer", ""),
-            guardrails=guardrails,
-            context={
-                "intent": "research",
-                "law_context": state.get("law_context", ""),
-            },
-        )
-
-        citation_retry = state.get("citation_retry", 0)
-        if "引用验证" in result["policy_flags"]:
-            if citation_retry < 1:
-                print(f"⚠️ [ResearchAgent:policy_check] 引用验证失败，准备重试...")
-                return {
-                    "final_answer": state.get("draft_answer", ""),
-                    "policy_flags": result["policy_flags"],
-                    "citation_issues": result.get("citation_issues", []),
-                    "citation_retry": citation_retry,
-                    "status": "citation_retry",
-                }
-            else:
-                print(f"⚠️ [ResearchAgent:policy_check] 引用验证仍失败，剥离引用...")
-                return {
-                    "final_answer": state.get("draft_answer", ""),
-                    "policy_flags": result["policy_flags"],
-                    "citation_issues": result.get("citation_issues", []),
-                    "citation_retry": citation_retry,
-                    "status": "strip",
-                }
-
-        return {
-            "final_answer": result["output"],
-            "policy_flags": result["policy_flags"],
-            "status": "done",
-        }
-
-    return check
-
-
-def check_policy_result(state: AppState) -> str:
-    """条件边：检查策略检查结果"""
-    status = state.get("status", "done")
-    if status == "citation_retry":
-        return "retry"
-    if status == "strip":
-        return "strip"
-    return "done"
-
-
 def make_re_synthesize_node(synthesis_chain):
     """创建重试合成节点（带增强提示）"""
 
@@ -263,7 +200,7 @@ def make_re_synthesize_node(synthesis_chain):
     )
 
     async def re_synthesize(state: AppState) -> Dict[str, Any]:
-        print(f"🔄 [ResearchAgent:re_synthesize] 引用验证失败，重新生成...")
+        print(f"🔄 [ResearchAgent:re_synthesize] Review Agent 发现问题，重新生成...")
 
         context_parts = []
         if state.get("law_context"):
@@ -281,7 +218,7 @@ def make_re_synthesize_node(synthesis_chain):
         return {
             "draft_answer": result,
             "final_answer": result,
-            "citation_retry": state.get("citation_retry", 0) + 1,
+            "review_retry": state.get("review_retry", 0) + 1,
             "tool_history": state.get("tool_history", []) + [{
                 "step": "re_synthesize",
                 "tool": "synthesis_chain_retry",
@@ -294,51 +231,17 @@ def make_re_synthesize_node(synthesis_chain):
     return re_synthesize
 
 
-def make_strip_citations_node():
-    """创建引用剥离节点（最终兜底）"""
-
-    LAW_PATTERN = re.compile(r'《[^》]+》')
-    ARTICLE_PATTERN = re.compile(r'第\d+条')
-    DISCLAIMER = (
-        "\n\n---\n"
-        "⚠️ **注意**: 以上建议基于相关法律法规，具体条文请以官方文本为准。"
-        "如需准确法律意见，请咨询持证律师。"
-    )
-
-    def strip(state: AppState) -> Dict[str, Any]:
-        print(f"🔧 [ResearchAgent:strip_citations] 剥离可疑引用，输出保守表述...")
-
-        text = state.get("final_answer", "")
-        text = LAW_PATTERN.sub("相关法规", text)
-        text = ARTICLE_PATTERN.sub("相关条款", text)
-
-        return {
-            "final_answer": text + DISCLAIMER,
-            "citation_issues": [],
-            "tool_history": state.get("tool_history", []) + [{
-                "step": "strip_citations",
-                "tool": "citation_stripper",
-                "input": "strip suspicious citations",
-                "output_len": len(text),
-                "timestamp": time.time(),
-            }],
-        }
-
-    return strip
-
-
 # ==================== 图构建 ====================
 
 def create_research_agent_graph(
     llm,
     retrieval_service: RetrievalService,
-    guardrails,
 ):
     """
     创建研究型任务 workflow 图
 
-    动态流程：plan → execute (循环) → synthesize → policy_check → END
-    引用验证失败时：policy_check → re_synthesize → policy_check → strip_citations → policy_check → END
+    动态流程：plan → execute (循环) → synthesize → review → END
+    Review Agent 发现引用问题时：review → re_synthesize → review → END
 
     Planner 根据用户问题自动决定使用哪些工具。
     适用场景：法律对比、求职搜索、行业研究等需要多步推理的任务。
@@ -346,7 +249,6 @@ def create_research_agent_graph(
     Args:
         llm: LangChain LLM 实例
         retrieval_service: RetrievalService 实例
-        guardrails: GuardrailsPipeline 实例
 
     Returns:
         编译好的 LangGraph graph
@@ -356,18 +258,16 @@ def create_research_agent_graph(
     plan_node = make_plan_node(llm)
     execute_node = make_execute_node(retrieval_service)
     synthesize_node = make_synthesize_node(llm)
-    policy_node = make_policy_check_node(guardrails)
+    review_node = create_review_agent_node(llm)
     re_synthesize_node = make_re_synthesize_node(synthesis_chain)
-    strip_node = make_strip_citations_node()
 
     workflow = StateGraph(AppState)
 
     workflow.add_node("plan", plan_node)
     workflow.add_node("execute", execute_node)
     workflow.add_node("synthesize", synthesize_node)
-    workflow.add_node("policy_check", policy_node)
+    workflow.add_node("review", review_node)
     workflow.add_node("re_synthesize", re_synthesize_node)
-    workflow.add_node("strip_citations", strip_node)
 
     workflow.set_entry_point("plan")
     workflow.add_edge("plan", "execute")
@@ -379,17 +279,15 @@ def create_research_agent_graph(
             "done": "synthesize",
         },
     )
-    workflow.add_edge("synthesize", "policy_check")
+    workflow.add_edge("synthesize", "review")
     workflow.add_conditional_edges(
-        "policy_check",
-        check_policy_result,
+        "review",
+        check_review_result,
         {
-            "retry": "re_synthesize",
-            "strip": "strip_citations",
-            "done": END,
+            "revise": "re_synthesize",
+            "approve": END,
         },
     )
-    workflow.add_edge("re_synthesize", "policy_check")
-    workflow.add_edge("strip_citations", "policy_check")
+    workflow.add_edge("re_synthesize", "review")
 
     return workflow.compile()

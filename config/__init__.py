@@ -67,7 +67,8 @@ class RerankerConfig:
     model_name: str = "BAAI/bge-reranker-v2-m3"
     device: str = "cpu"  # 节省显存
     batch_size: int = 32
-    top_k: int = 3
+    top_k: int = 5  # rerank 后保留数量
+    score_threshold: float = 0.3  # rerank 分数阈值，低于此值的文档被过滤
 
 
 @dataclass
@@ -75,10 +76,11 @@ class RetrievalConfig:
     """检索配置"""
     faiss_index_path: str = "faiss_legal_index"
     knowledge_base_path: str = "labor_law.txt"
-    bm25_weight: float = 0.5
-    faiss_weight: float = 0.5
-    retrieval_k: int = 5  # 粗排返回数量
+    bm25_weight: float = 0.4  # BM25 权重（法律文本关键词匹配更重要）
+    faiss_weight: float = 0.6  # FAISS 权重
+    retrieval_k: int = 8  # 粗排返回数量（给 reranker 更多候选）
     rerank_enabled: bool = True
+    hyde_enabled: bool = True  # HyDE 查询改写开关，统一控制所有路径
 
 
 @dataclass

@@ -3,13 +3,12 @@
 合同审查 LangGraph Workflow
 
 固定流程，不需要 Planner 动态规划：
-  retrieve → analyze → policy_check
+  retrieve → analyze → review (Review Agent)
 
 为什么不用 Planner：
   合同审查的步骤是固定的（检索法律 → 对比分析 → 输出），
   让 9B 模型去规划"先检索再分析"是浪费 token。
 """
-import re
 import time
 from typing import Dict, Any
 from langgraph.graph import StateGraph, END
@@ -17,7 +16,7 @@ from langgraph.graph import StateGraph, END
 from utils.state import AppState
 from utils.retrieval_service import RetrievalService
 from utils.tools.contract_tools import create_contract_chain
-from utils.tools.common_tools import policy_check
+from workflows.review_agent import create_review_agent_node, check_review_result
 
 
 def make_retrieve_node(retrieval_service: RetrievalService):
@@ -27,7 +26,7 @@ def make_retrieve_node(retrieval_service: RetrievalService):
         query = state["query"]
         print(f"🔍 [ContractReview:retrieve] 检索法律条文: {query[:50]}...")
 
-        law_context = retrieval_service.retrieve_as_string(query, use_hyde=True)
+        law_context = retrieval_service.retrieve_as_string(query)
 
         return {
             "law_context": law_context,
@@ -71,68 +70,6 @@ def make_analyze_node(contract_chain):
     return analyze
 
 
-def make_policy_check_node(guardrails):
-    """创建策略检查节点
-
-    引用验证失败时的路由逻辑：
-    - citation_retry == 0 → status="citation_retry" → 走 re_synthesize
-    - citation_retry >= 1 → status="strip" → 走 strip_citations
-    - 无引用问题 → status="done"
-    """
-
-    def check(state: AppState) -> Dict[str, Any]:
-        print(f"🛡️ [ContractReview:policy_check] 合规检查中...")
-
-        result = policy_check(
-            response=state.get("final_answer", ""),
-            guardrails=guardrails,
-            context={
-                "intent": "contract_critique",
-                "law_context": state.get("law_context", ""),
-            },
-        )
-
-        # 引用验证失败时，根据重试次数决定下一步
-        citation_retry = state.get("citation_retry", 0)
-        if "引用验证" in result["policy_flags"]:
-            if citation_retry < 1:
-                print(f"⚠️ [ContractReview:policy_check] 引用验证失败，准备重试...")
-                return {
-                    "final_answer": state.get("draft_answer", ""),
-                    "policy_flags": result["policy_flags"],
-                    "citation_issues": result.get("citation_issues", []),
-                    "citation_retry": citation_retry,
-                    "status": "citation_retry",
-                }
-            else:
-                print(f"⚠️ [ContractReview:policy_check] 引用验证仍失败，剥离引用...")
-                return {
-                    "final_answer": state.get("draft_answer", ""),
-                    "policy_flags": result["policy_flags"],
-                    "citation_issues": result.get("citation_issues", []),
-                    "citation_retry": citation_retry,
-                    "status": "strip",
-                }
-
-        return {
-            "final_answer": result["output"],
-            "policy_flags": result["policy_flags"],
-            "status": "done",
-        }
-
-    return check
-
-
-def check_policy_result(state: AppState) -> str:
-    """条件边：检查策略检查结果"""
-    status = state.get("status", "done")
-    if status == "citation_retry":
-        return "retry"
-    if status == "strip":
-        return "strip"
-    return "done"
-
-
 def make_re_synthesize_node(contract_chain):
     """创建重试合成节点（带增强提示）"""
 
@@ -143,7 +80,7 @@ def make_re_synthesize_node(contract_chain):
     )
 
     async def re_synthesize(state: AppState) -> Dict[str, Any]:
-        print(f"🔄 [ContractReview:re_synthesize] 引用验证失败，重新生成...")
+        print(f"🔄 [ContractReview:re_synthesize] Review Agent 发现问题，重新生成...")
 
         result = await contract_chain.ainvoke({
             "history": state.get("history", ""),
@@ -155,7 +92,7 @@ def make_re_synthesize_node(contract_chain):
         return {
             "draft_answer": result,
             "final_answer": result,
-            "citation_retry": state.get("citation_retry", 0) + 1,
+            "review_retry": state.get("review_retry", 0) + 1,
             "tool_history": state.get("tool_history", []) + [{
                 "step": "re_synthesize",
                 "tool": "contract_chain_retry",
@@ -168,57 +105,19 @@ def make_re_synthesize_node(contract_chain):
     return re_synthesize
 
 
-def make_strip_citations_node():
-    """创建引用剥离节点（最终兜底）
-
-    将具体法律名和条文号替换为概括性表述，避免幻觉引用误导用户。
-    """
-
-    LAW_PATTERN = re.compile(r'《[^》]+》')
-    ARTICLE_PATTERN = re.compile(r'第\d+条')
-    DISCLAIMER = (
-        "\n\n---\n"
-        "⚠️ **注意**: 以上建议基于相关法律法规，具体条文请以官方文本为准。"
-        "如需准确法律意见，请咨询持证律师。"
-    )
-
-    def strip(state: AppState) -> Dict[str, Any]:
-        print(f"🔧 [ContractReview:strip_citations] 剥离可疑引用，输出保守表述...")
-
-        text = state.get("final_answer", "")
-        text = LAW_PATTERN.sub("相关法规", text)
-        text = ARTICLE_PATTERN.sub("相关条款", text)
-
-        return {
-            "final_answer": text + DISCLAIMER,
-            "citation_issues": [],
-            "tool_history": state.get("tool_history", []) + [{
-                "step": "strip_citations",
-                "tool": "citation_stripper",
-                "input": "strip suspicious citations",
-                "output_len": len(text),
-                "timestamp": time.time(),
-            }],
-        }
-
-    return strip
-
-
 def create_contract_review_graph(
     llm,
     retrieval_service: RetrievalService,
-    guardrails,
 ):
     """
     创建合同审查 workflow 图
 
-    流程：retrieve → analyze → policy_check → END
-    引用验证失败时：policy_check → re_synthesize → policy_check → strip_citations → policy_check → END
+    流程：retrieve → analyze → review → END
+    Review Agent 发现引用问题时：review → re_synthesize → review → END
 
     Args:
         llm: LangChain LLM 实例
         retrieval_service: RetrievalService 实例
-        guardrails: GuardrailsPipeline 实例
 
     Returns:
         编译好的 LangGraph graph
@@ -227,31 +126,27 @@ def create_contract_review_graph(
 
     retrieve_node = make_retrieve_node(retrieval_service)
     analyze_node = make_analyze_node(contract_chain)
-    policy_node = make_policy_check_node(guardrails)
+    review_node = create_review_agent_node(llm)
     re_synthesize_node = make_re_synthesize_node(contract_chain)
-    strip_node = make_strip_citations_node()
 
     workflow = StateGraph(AppState)
 
     workflow.add_node("retrieve", retrieve_node)
     workflow.add_node("analyze", analyze_node)
-    workflow.add_node("policy_check", policy_node)
+    workflow.add_node("review", review_node)
     workflow.add_node("re_synthesize", re_synthesize_node)
-    workflow.add_node("strip_citations", strip_node)
 
     workflow.set_entry_point("retrieve")
     workflow.add_edge("retrieve", "analyze")
-    workflow.add_edge("analyze", "policy_check")
+    workflow.add_edge("analyze", "review")
     workflow.add_conditional_edges(
-        "policy_check",
-        check_policy_result,
+        "review",
+        check_review_result,
         {
-            "retry": "re_synthesize",
-            "strip": "strip_citations",
-            "done": END,
+            "revise": "re_synthesize",
+            "approve": END,
         },
     )
-    workflow.add_edge("re_synthesize", "policy_check")
-    workflow.add_edge("strip_citations", "policy_check")
+    workflow.add_edge("re_synthesize", "review")
 
     return workflow.compile()

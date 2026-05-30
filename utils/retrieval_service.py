@@ -2,17 +2,10 @@
 """
 统一检索服务
 
-封装 HyDE 查询改写 + BM25/FAISS 混合检索 + Cross-Encoder Rerank，
-消除 contract chain 和 ReAct agent 之间的检索代码重复。
+封装 HyDE 查询改写 + BM25/FAISS 混合检索 + Cross-Encoder Rerank。
 
-使用方式：
-    # 作为检索管线（contract 路径，带 HyDE）
-    service = RetrievalService(retriever, reranker, query_rewriter)
-    law_ctx = service.retrieve_as_string(query, use_hyde=True)
-
-    # 作为 LangChain Tool（ReAct agent 路径，不带 HyDE）
-    tool = service.as_tool()
-    agent = create_react_agent(llm, [tool, ...], prompt)
+HyDE 开关由 config.retrieval.hyde_enabled 统一控制，
+调用方可传 use_hyde=True/False 覆盖，传 None 则使用配置默认值。
 """
 from typing import List, Optional
 from langchain.tools import tool
@@ -32,26 +25,33 @@ class RetrievalService:
         retriever,           # EnsembleRetriever 实例
         reranker=None,       # RerankService 实例，可选
         query_rewriter=None, # QueryRewriter 实例，可选
-        top_k: int = 3,
+        top_k: int = 5,
         rerank_enabled: bool = True,
+        score_threshold: float = 0.3,
+        hyde_enabled: bool = True,
     ):
         self.retriever = retriever
         self.reranker = reranker
         self.query_rewriter = query_rewriter
         self.top_k = top_k
         self.rerank_enabled = rerank_enabled
+        self.score_threshold = score_threshold
+        self.hyde_enabled = hyde_enabled
 
-    def retrieve(self, query: str, use_hyde: bool = False) -> List[Document]:
+    def retrieve(self, query: str, use_hyde: Optional[bool] = None) -> List[Document]:
         """
         统一检索入口
 
         Args:
             query: 用户查询
-            use_hyde: 是否启用 HyDE 查询改写（contract 路径用 True，agent tool 用 False）
+            use_hyde: 是否启用 HyDE 查询改写。None 时使用 self.hyde_enabled 默认值
 
         Returns:
             检索并重排序后的文档列表
         """
+        if use_hyde is None:
+            use_hyde = self.hyde_enabled
+
         # 1. 可选 HyDE 改写
         effective_query = query
         if use_hyde and self.query_rewriter:
@@ -63,20 +63,24 @@ class RetrievalService:
                 effective_query = query
 
         # 2. 混合检索 (BM25 + FAISS)
-        raw_docs = self.retriever.get_relevant_documents(effective_query)
+        raw_docs = self.retriever.invoke(effective_query)
 
         if not raw_docs:
             return []
 
         # 3. Cross-Encoder Rerank
         if self.rerank_enabled and self.reranker is not None:
-            reranked_docs = self.reranker.rerank(query, raw_docs, top_k=self.top_k)
+            reranked_docs = self.reranker.rerank(
+                query, raw_docs,
+                top_k=self.top_k,
+                score_threshold=self.score_threshold,
+            )
             return reranked_docs
 
         return raw_docs[: self.top_k]
 
     def retrieve_as_string(
-        self, query: str, use_hyde: bool = False, separator: str = "\n\n"
+        self, query: str, use_hyde: Optional[bool] = None, separator: str = "\n\n"
     ) -> str:
         """
         检索并返回拼接后的文本
@@ -117,6 +121,6 @@ class RetrievalService:
             Returns:
                 相关文档内容
             """
-            return service.retrieve_as_string(query, use_hyde=False)
+            return service.retrieve_as_string(query)
 
         return local_knowledge_search
