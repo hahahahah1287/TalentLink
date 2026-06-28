@@ -4,10 +4,11 @@
   <img src="https://img.shields.io/badge/Python-3.13+-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/LangGraph-0.2.x-green.svg" alt="LangGraph">
   <img src="https://img.shields.io/badge/LLM-Qwen3.5-purple.svg" alt="Qwen">
+  <img src="https://img.shields.io/badge/Langfuse-Observability-orange.svg" alt="Langfuse">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
 </p>
 
-> 基于 LangGraph 状态图的本地化法务 AI 系统。两条 workflow 覆盖合同审查和通用研究，Review Agent 自主审查输出质量，全程本地推理，数据不出域。
+> 基于 LangGraph 状态图的本地化法务 AI 系统。两条 workflow 覆盖合同审查和通用研究，Review Agent 自主审查输出质量，全程本地推理，数据不出域。集成 Langfuse 实现全链路可观测性。
 
 ---
 
@@ -82,6 +83,95 @@
 - **元数据标注**：LLM 自动标注每条的法律领域、关键词、适用场景
 - **带元数据索引**：FAISS 索引携带元数据，支持过滤检索
 
+### Langfuse 可观测性
+
+集成 [Langfuse](https://langfuse.com/) 实现 LLM 调用的全链路追踪，无需侵入业务代码。
+
+- **自动 Trace**：通过 `LangfuseLLMCallback` 回调，自动捕获每次 LLM 调用的输入、输出、Token 用量和延迟
+- **Workflow 级 Span**：每个 workflow 节点（retrieve / analyze / review 等）自动创建 Span，支持端到端链路分析
+- **无侵入集成**：回调通过 LangChain 的 `callbacks` 机制注入，workflow 代码无需改动
+
+配置方式：
+
+```bash
+# 环境变量（推荐）
+export LANGFUSE_PUBLIC_KEY="pk-..."
+export LANGFUSE_SECRET_KEY="sk-..."
+export LANGFUSE_HOST="http://localhost:3000"   # 自部署或 Langfuse Cloud
+```
+
+```python
+# config/__init__.py 中的相关配置
+@dataclass
+class LangfuseConfig:
+    enabled: bool = True
+    host: str = "http://localhost:3000"
+    public_key: str = ""       # 或通过环境变量 LANGFUSE_PUBLIC_KEY
+    secret_key: str = ""       # 或通过环境变量 LANGFUSE_SECRET_KEY
+    flush_at: int = 15         # 批量上报阈值
+    flush_interval: float = 1.0  # 定时上报间隔（秒）
+```
+
+Langfuse 提供以下端点用于查看追踪数据：
+
+| 端点 | 用途 |
+|------|------|
+| `GET /api/public/traces` | 查询所有 Trace 记录 |
+| `GET /api/public/observations` | 查询 Span/Span 详情 |
+| `GET /api/public/scores` | 查询评估分数 |
+| Web UI `/project/traces` | 可视化链路追踪看板 |
+
+详细部署指南见 `LANGFUSE_SETUP.md`。
+
+### Redis 结果缓存（WorkflowCheckpoint）
+
+基于 Redis 的 workflow 结果缓存，相同查询直接返回历史结果，跳过整个 workflow 执行。
+
+- **缓存键**：`checkpoint:{workflow}:{query_hash}`，按 workflow 类型 + 查询内容的 MD5 哈希索引
+- **TTL 过期**：默认 1 小时，支持手动失效和批量清除
+- **智能写入**：只缓存有效结果（`final_answer` 非空且长度 > 10），避免缓存异常输出
+- **命中率统计**：内置 hits/misses 计数器，支持运行时监控
+- **无缓存降级**：Redis 不可用时自动降级为无缓存模式，不影响正常服务
+
+```python
+# WorkflowService 中的使用方式
+from utils import WorkflowCheckpoint
+
+checkpoint = WorkflowCheckpoint(redis_client, ttl=3600)
+
+# 执行前检查缓存
+cached = checkpoint.get("contract", query)
+if cached:
+    return cached
+
+# 执行 workflow ...
+result = await graph.ainvoke(state)
+
+# 写入缓存
+checkpoint.set("contract", query, result)
+```
+
+### ToolCallParserLLM — LLM Tool Call XML 解析修复
+
+解决 ChatLlamaCpp + Qwen 3.5 等模型的 tool call 输出格式兼容问题。
+
+**问题**：模型通过 `bind_tools` 学会了输出 tool call，但以纯文本 XML 格式输出在 `content` 字段，而非标准的 `tool_calls` 属性。导致 `create_react_agent` 的 Agent Loop 将 XML 当作最终回答返回，工具调用链路断裂。
+
+**方案**：`ToolCallParserLLM` 包装层，在 `invoke`/`ainvoke` 后自动：
+1. 检查 `AIMessage.tool_calls` 是否为空
+2. 若为空，从 `content` 解析 XML 标签填充到 `tool_calls`
+3. 清理 `content` 中的 XML 残留
+
+```python
+from utils import ToolCallParserLLM
+
+raw_llm = ChatLlamaCpp(model_path=..., n_ctx=4096)
+llm = ToolCallParserLLM(raw_llm)
+agent = create_react_agent(llm, tools=[...])  # 自动受益，无需改动 Agent 代码
+```
+
+透明代理设计：`bind_tools`、`with_structured_output` 等方法透传到底层 LLM，`__getattr__` 兜底其余属性，对上层完全透明。
+
 ### 其他
 
 - **语义缓存**：相似查询直接返回历史答案，跳过 LLM 推理
@@ -106,6 +196,7 @@
 | Web 框架 | FastAPI |
 | 数据库 | MySQL + Redis |
 | 推理引擎 | llama-cpp-python |
+| 可观测性 | Langfuse（LLM 调用追踪 + 链路分析） |
 
 ---
 
@@ -117,6 +208,7 @@
 - CUDA 11.8+ (可选，GPU 加速)
 - MySQL 8.0+
 - Redis 7.0+ (可选，用于缓存和异步写入)
+- Langfuse (可选，用于可观测性，支持自部署或 Cloud)
 
 ### 安装
 
@@ -194,14 +286,26 @@ talentlink/
 ├── main.py                      # FastAPI 入口
 ├── workflow_service.py          # LangGraph Workflow Service（核心服务层）
 ├── memory.py                    # 会话管理 (MySQL/Redis/摘要)
+├── LANGFUSE_SETUP.md            # Langfuse 部署与配置指南
 ├── config/
 │   └── __init__.py              # 集中化配置 (dataclass)
 ├── workflows/
 │   ├── __init__.py
 │   ├── contract_review.py       # 合同审查 workflow
 │   ├── research_agent.py        # 研究型任务 workflow
-│   └── review_agent.py          # Review Agent（输出审查）
+│   ├── review_agent.py          # Review Agent（输出审查）
+│   └── shared_nodes.py          # 共享 LangGraph 节点（synthesize 等）
+├── skills/
+│   ├── __init__.py
+│   ├── base.py                  # Skill 基类
+│   ├── registry.py              # 技能注册表（SkillRegistry）
+│   ├── web_search.py            # 联网搜索 / 招聘搜索
+│   ├── risk_clause_detector.py  # 风险条款识别
+│   ├── compliance_check.py      # 合规性检查
+│   ├── legal_term_explainer.py  # 法律术语解释
+│   └── statute_checker.py       # 法条适用性检查
 ├── utils/
+│   ├── __init__.py
 │   ├── retrieval_service.py     # 统一检索服务（HyDE + 混合检索 + Rerank）
 │   ├── reranker.py              # Cross-Encoder 重排序
 │   ├── query_rewriter.py        # HyDE 查询改写
@@ -210,6 +314,9 @@ talentlink/
 │   ├── legal_parser.py          # 法律文档结构化切分
 │   ├── metadata_annotator.py    # LLM 元数据标注
 │   ├── state.py                 # LangGraph AppState 定义
+│   ├── checkpoint.py            # Redis 结果缓存（WorkflowCheckpoint）
+│   ├── tool_call_parser.py      # ToolCallParserLLM（XML tool call 解析）
+│   ├── langfuse_integration.py  # Langfuse 回调与 Trace 集成
 │   └── tools/
 │       ├── contract_tools.py    # 合同分析 LLM Chain
 │       ├── guard_tools.py       # Guard → LangChain Tool 封装
@@ -252,6 +359,7 @@ talentlink/
 ## 致谢
 
 - [LangChain](https://github.com/langchain-ai/langchain) / [LangGraph](https://github.com/langchain-ai/langgraph) - Agent/Workflow 框架
+- [Langfuse](https://github.com/langfuse/langfuse) - LLM 可观测性平台
 - [Qwen](https://github.com/QwenLM/Qwen3.5) - 基座模型
 - [BAAI/bge](https://github.com/FlagOpen/FlagEmbedding) - Embedding 和 Reranker
 - [FAISS](https://github.com/facebookresearch/faiss) - 向量数据库

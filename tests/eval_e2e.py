@@ -153,6 +153,50 @@ RESEARCH_EVAL_DATASET = [
         "ground_truth": "根据劳动争议调解仲裁法第二十七条，劳动争议申请仲裁的时效期间为一年，从当事人知道或者应当知道其权利被侵害之日起计算。",
         "expected_tools": ["legal_search", "synthesis_chain", "review_agent"],
     },
+    # --- 新增 skill 测试用例：风险条款识别 ---
+    {
+        "query": "请帮我检查这份合同有没有风险条款：试用期为8个月，劳动合同期限为2年。员工自愿加班，公司不支付加班费。员工离职后3年内不得在同行业就业。",
+        "ground_truth": "该合同存在多个风险条款：试用期8个月超过法定上限2个月；约定不支付加班费违反劳动法；竞业限制3年超过法定上限2年。",
+        "expected_tools": ["risk_clause_detector", "synthesis_chain", "review_agent"],
+    },
+    {
+        "query": "分析这份合同的风险：公司有权随时解除劳动合同且无需补偿。入职需缴纳押金2000元。违约金5万元。",
+        "ground_truth": "该合同存在严重风险：单方随时解除条款违法；收取押金违法；除服务期和竞业限制外不得约定违约金。",
+        "expected_tools": ["risk_clause_detector", "synthesis_chain", "review_agent"],
+    },
+    # --- 新增 skill 测试用例：合规检查 ---
+    {
+        "query": "公司规定试用期6个月，劳动合同签了1年，试用期工资是正式工资的70%，这样合法吗？",
+        "ground_truth": "不合法。1年期限的劳动合同试用期不得超过1个月，试用期工资不得低于80%。",
+        "expected_tools": ["compliance_check", "synthesis_chain", "review_agent"],
+    },
+    {
+        "query": "我们公司要求员工每天加班4小时，没有加班费，只给调休，这样合规吗？",
+        "ground_truth": "不合规。每日加班不超过1小时特殊情况不超过3小时，每月不超过36小时。加班必须支付加班费，不能仅以调休替代。",
+        "expected_tools": ["compliance_check", "synthesis_chain", "review_agent"],
+    },
+    # --- 新增 skill 测试用例：法律术语解释 ---
+    {
+        "query": "帮我解释一下什么是经济补偿金和赔偿金，有什么区别？",
+        "ground_truth": "经济补偿金是用人单位合法解除劳动合同时支付的补偿，按工作年限每满一年支付一个月工资。赔偿金是违法解除时支付的惩罚性赔偿，标准是经济补偿金的两倍。",
+        "expected_tools": ["legal_term_explainer", "synthesis_chain", "review_agent"],
+    },
+    {
+        "query": "合同里提到了竞业限制和服务期协议，我不太懂是什么意思，能解释一下吗？",
+        "ground_truth": "竞业限制是离职后一定时间内不能去竞争对手公司工作，单位需按月支付补偿金。服务期协议是单位出钱培训后约定必须工作一定年限，提前离职需退还培训费。",
+        "expected_tools": ["legal_term_explainer", "synthesis_chain", "review_agent"],
+    },
+    # --- 新增 skill 测试用例：时效计算器 ---
+    {
+        "query": "我2024年3月被公司违法辞退了，现在还能申请劳动仲裁吗？",
+        "ground_truth": "劳动仲裁时效为1年，从知道权利被侵害之日起计算。2024年3月被辞退，仲裁时效至2025年3月届满。",
+        "expected_tools": ["statute_checker", "synthesis_chain", "review_agent"],
+    },
+    {
+        "query": "公司从2023年1月开始拖欠我的工资，我现在还在职，能申请仲裁吗？",
+        "ground_truth": "劳动关系存续期间因拖欠劳动报酬发生争议的，不受1年仲裁时效限制。在职期间可以随时申请仲裁。",
+        "expected_tools": ["statute_checker", "synthesis_chain", "review_agent"],
+    },
 ]
 
 

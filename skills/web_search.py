@@ -51,5 +51,17 @@ def job_search(query: str) -> str:
         return f"招聘搜索失败: {str(e)}"
 
 
+# ==================== 统一接口 ====================
+
+def web_search_skill(query: str) -> str:
+    """统一接口：联网搜索"""
+    return web_search.invoke({"query": query})
+
+
+def job_search_skill(query: str) -> str:
+    """统一接口：招聘搜索"""
+    return job_search.invoke({"query": query})
+
+
 # 导出的工具列表
 WEB_SEARCH_TOOLS = [web_search, job_search]

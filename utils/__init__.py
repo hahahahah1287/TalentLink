@@ -22,6 +22,8 @@ from .guardrails import GuardrailsPipeline
 from .legal_parser import parse_legal_document
 from .metadata_annotator import annotate_documents
 from .retrieval_service import RetrievalService
+from .checkpoint import WorkflowCheckpoint
+from .tool_call_parser import ToolCallParserLLM
 
 __all__ = [
     "RerankService",
@@ -34,4 +36,6 @@ __all__ = [
     "parse_legal_document",
     "annotate_documents",
     "RetrievalService",
+    "WorkflowCheckpoint",
+    "ToolCallParserLLM",
 ]

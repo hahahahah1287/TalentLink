@@ -38,11 +38,20 @@ from utils import (
     QueryRewriter,
     SemanticCache,
     RetrievalService,
+    WorkflowCheckpoint,
     parse_legal_document,
     annotate_documents,
 )
+from utils.tool_call_parser import ToolCallParserLLM
 from memory import ChatHistoryManager
 from workflows import create_contract_review_graph, create_research_agent_graph
+from skills.registry import SkillRegistry
+from skills.web_search import web_search, job_search, web_search_skill, job_search_skill
+from skills.risk_clause_detector import risk_clause_skill, init_skill as init_risk_skill
+from skills.compliance_check import compliance_skill, init_skill as init_compliance_skill
+from skills.legal_term_explainer import legal_term_skill
+from skills.statute_checker import statute_skill
+from workflows.research_agent import make_react_step_executor
 
 
 class WorkflowService:
@@ -68,6 +77,11 @@ class WorkflowService:
             verbose=self.config.llm.verbose,
             streaming=True,
         )
+
+        # 包装 LLM：自动解析 content 中的 tool call XML → tool_calls 属性
+        # 只影响 create_react_agent（Review Agent、复杂 skill ReAct），
+        # Plan-and-Execute 链路使用原始 self.llm，不受影响。
+        self.agent_llm = ToolCallParserLLM(self.llm)
 
         # --- 2. 加载 Embedding ---
         print(f"📦 [WorkflowService] 加载 Embedding...")
@@ -141,15 +155,52 @@ class WorkflowService:
             ttl=3600,
         )
 
-        # --- 10. 创建 LangGraph workflows ---
+        # --- 9.1 初始化 Workflow Checkpoint 缓存 ---
+        checkpoint_ttl = getattr(self.config, 'checkpoint_ttl', 3600)
+        self.checkpoint = WorkflowCheckpoint(
+            redis_client=redis_client,
+            ttl=checkpoint_ttl,
+            enabled=checkpoint_ttl > 0,
+        )
+
+        # --- 10. 初始化 LLM 驱动的 Skills ---
+        init_risk_skill(self.llm)
+        init_compliance_skill(self.llm)
+
+        # --- 11. 初始化 Skill Registry ---
+        self.registry = SkillRegistry()
+        # 简单 skill：直接调用，无需推理
+        self.registry.register("web_search", web_search_skill, "联网搜索最新信息（查最新政策、新闻、行业动态等）", category="search", complexity="simple")
+        self.registry.register("job_search", job_search_skill, "搜索招聘信息（查职位、薪资、公司招聘等）", category="search", complexity="simple")
+        self.registry.register("legal_term_explainer", legal_term_skill, "法律术语解释（解释合同或法律中的专业术语，如经济补偿金、竞业限制等）", complexity="simple")
+        self.registry.register("statute_checker", statute_skill, "时效计算器（计算仲裁/诉讼时效是否届满，需要提供事件发生时间）", complexity="simple")
+        # 复杂 skill：ReAct Agent 执行，可自主调用检索工具
+        self.registry.register("risk_clause_detector", risk_clause_skill, "风险条款识别（分析合同中的高风险条款，如试用期违规、违约金过高等）", complexity="complex")
+        self.registry.register("compliance_check", compliance_skill, "劳动法合规检查（检查用工场景是否合法，如加班、解除合同、社保等）", complexity="complex")
+        print(f"📦 [WorkflowService] 已注册 {len(self.registry)} 个 skills: {self.registry}")
+
+        # --- 12. 创建 ReAct 执行器（用于复杂 step） ---
+        # 使用 agent_llm（带 tool call 解析），让 ReAct Agent 正确调度工具
+        self.react_executor = make_react_step_executor(
+            llm=self.agent_llm,
+            retrieval_service=self.retrieval_service,
+            registry=self.registry,
+            extra_tools=[web_search, job_search],
+        )
+
+        # --- 13. 创建 LangGraph workflows ---
+        # agent_llm 用于 Review Agent（create_react_agent）
+        # 原始 self.llm 用于 Plan-and-Execute 链路（文本生成，不依赖 tool_calls）
         print("📦 [WorkflowService] 创建 LangGraph workflows...")
         self.contract_graph = create_contract_review_graph(
-            llm=self.llm,
+            llm=self.agent_llm,
             retrieval_service=self.retrieval_service,
         )
         self.research_graph = create_research_agent_graph(
-            llm=self.llm,
+            llm=self.agent_llm,
             retrieval_service=self.retrieval_service,
+            registry=self.registry,
+            react_executor=self.react_executor,
         )
 
         print("✅ [WorkflowService] 所有组件初始化完成")
@@ -244,6 +295,18 @@ class WorkflowService:
             yield f'event: end\ndata: {{"session_id": "{current_session_id}"}}\n\n'
             return
 
+        # 3.1 Workflow Checkpoint 缓存查询
+        checkpoint_key_scene = scene if scene in ("contract", "research") else "research"
+        cached_result = self.checkpoint.get(checkpoint_key_scene, query)
+        if cached_result:
+            full_response = cached_result.get("final_answer", "")
+            if full_response:
+                yield f"data: {full_response}\n\n"
+                self.history_manager.add_message(current_session_id, "user", query)
+                self.history_manager.add_message(current_session_id, "assistant", full_response)
+                yield f'event: end\ndata: {{"session_id": "{current_session_id}"}}\n\n'
+                return
+
         # 4. 获取对话历史
         history_str = self.history_manager.get_history_str(
             current_session_id,
@@ -274,6 +337,7 @@ class WorkflowService:
 
         # 7. 根据 scene 路由到对应 workflow
         full_response = ""
+        result = {}
         try:
             if scene == "contract":
                 yield "data: [正在进行合同审查（检索法律条文 → 对比分析 → 合规检查）...]\n\n"
@@ -285,6 +349,10 @@ class WorkflowService:
                 full_response = result.get("final_answer", "")
 
             yield f"data: {full_response}\n\n"
+
+            # 7.1 写入 Workflow Checkpoint 缓存
+            if result and full_response and len(full_response.strip()) > 10:
+                self.checkpoint.set(checkpoint_key_scene, query, result)
 
         except Exception as e:
             full_response = f"系统内部错误: {str(e)}"
@@ -303,6 +371,7 @@ class WorkflowService:
         """获取系统运行指标"""
         return {
             "semantic_cache": self.semantic_cache.get_metrics(),
+            "checkpoint": self.checkpoint.get_metrics(),
         }
 
     def shutdown(self):

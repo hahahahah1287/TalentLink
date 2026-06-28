@@ -2,28 +2,35 @@
 """
 研究型任务 LangGraph Workflow
 
-通用的研究型任务图，不限于求职。Planner 根据用户问题自动决定使用哪些工具：
+混合策略：Plan-and-Execute（全局规划） + ReAct（复杂 step 内灵活执行）。
+
+架构：
   plan → execute (循环) → synthesize → review (Review Agent)
 
-适用场景：
-- "对比旧法律和新法律的区别" → legal_search + web_search
-- "附近有什么工作" → job_search
-- "劳动法第38条说了啥，顺便看看市场薪资" → legal_search + web_search + job_search
+执行策略：
+- 简单 step（web_search、job_search 等）→ 直接调用
+- 复杂 step（risk_clause_detector、compliance_check）→ ReAct Agent 自主推理
+  ReAct Agent 可灵活调用检索工具 + skill 工具，自主决定执行顺序
 
 Planner 使用硬编码 JSON 解析 + fallback，适配 9B 小模型。
 """
 import json
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import create_react_agent
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage, AIMessage
 
 from utils.state import AppState
 from utils.retrieval_service import RetrievalService
-from utils.tools.job_tools import web_search, job_search
 from utils.tools.contract_tools import create_synthesis_chain
-from workflows.review_agent import create_review_agent_node, check_review_result
+from utils.tool_call_parser import _strip_tool_call_xml
+from workflows.review_agent import create_review_agent_node, create_remove_citations_node, check_review_result
+from workflows.shared_nodes import RETRY_PROMPT_SUFFIX
+from skills.registry import SkillRegistry
+from skills.base import create_skill_tool
 
 
 # ==================== 硬编码 fallback 计划 ====================
@@ -31,18 +38,125 @@ from workflows.review_agent import create_review_agent_node, check_review_result
 FALLBACK_PLAN = ["legal_search", "web_search"]
 
 
+# ==================== ReAct Step Executor ====================
+
+def make_react_step_executor(
+    llm,
+    retrieval_service: RetrievalService,
+    registry: SkillRegistry,
+    extra_tools: list = None,
+):
+    """
+    为复杂 step 创建 ReAct Agent 执行器
+
+    ReAct Agent 拥有：
+    - 检索工具（local_knowledge_search）
+    - 搜索工具（web_search、job_search 等，通过 extra_tools 传入）
+    - step 对应的 skill 工具
+
+    Agent 自主决定调用哪些工具、以什么顺序调用。
+
+    Args:
+        llm: LangChain LLM 实例
+        retrieval_service: RetrievalService 实例
+        registry: SkillRegistry 实例
+        extra_tools: 额外工具列表（如 WEB_SEARCH_TOOLS）
+
+    Returns:
+        execute_complex_step(step_name, query) 函数
+    """
+    retrieval_tool = retrieval_service.as_tool()  # local_knowledge_search
+    extra_tools = extra_tools or []
+
+    # 缓存已创建的 ReAct agent（按 step_name）
+    _agent_cache: dict[str, Any] = {}
+
+    def _build_prompt(step_name: str, all_tools: list) -> str:
+        """根据可用工具动态生成系统 prompt"""
+        tool_lines = []
+        for t in all_tools:
+            name = getattr(t, "name", t.__class__.__name__)
+            desc = getattr(t, "description", "")
+            tool_lines.append(f"- {name}: {desc}")
+        tools_text = "\n".join(tool_lines)
+
+        return (
+            f"你是法律分析助手。请根据用户问题自主完成任务。\n\n"
+            f"可用工具：\n"
+            f"{tools_text}\n\n"
+            f"提示：\n"
+            f"- 需要法律依据时，用 local_knowledge_search 检索\n"
+            f"- 需要联网补充信息时，用 web_search 或 job_search\n"
+            f"- 调用 {step_name} 时，把检索到的内容通过 law_context 参数传入\n\n"
+            f"请自主决定工具调用顺序和策略。"
+        )
+
+    def _get_or_create_agent(step_name: str):
+        """懒加载 ReAct Agent（缓存，避免重复创建）"""
+        if step_name not in _agent_cache:
+            skill_fn = registry.get_skill_fn(step_name)
+            description = registry.get_description(step_name) or step_name
+            skill_tool = create_skill_tool(skill_fn, step_name, description)
+
+            all_tools = [retrieval_tool] + extra_tools + [skill_tool]
+
+            _agent_cache[step_name] = create_react_agent(
+                llm,
+                tools=all_tools,
+                prompt=_build_prompt(step_name, all_tools),
+            )
+        return _agent_cache[step_name]
+
+    def execute_complex_step(step_name: str, query: str) -> str:
+        """
+        用 ReAct Agent 执行复杂 step
+
+        Args:
+            step_name: skill 名称
+            query: 用户问题
+
+        Returns:
+            ReAct Agent 的最终回复文本
+        """
+        print(f"🤖 [ReAct] 执行复杂 step: {step_name}")
+        agent = _get_or_create_agent(step_name)
+
+        # 限制迭代次数，防止 9B 模型无限循环
+        result = agent.invoke(
+            {"messages": [HumanMessage(content=query)]},
+            config={"recursion_limit": 6},
+        )
+
+        # 提取最后一条 AIMessage 的内容
+        messages = result.get("messages", [])
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+                cleaned = _strip_tool_call_xml(msg.content)
+                if cleaned:
+                    return cleaned
+
+        # fallback：返回最后一条消息（清理 tool call XML）
+        if messages:
+            last = messages[-1]
+            if hasattr(last, "content") and last.content:
+                return _strip_tool_call_xml(str(last.content))
+        return ""
+
+    return execute_complex_step
+
+
 # ==================== 节点工厂 ====================
 
-def make_plan_node(llm):
-    """创建 Planner 节点"""
+def make_plan_node(llm, registry: SkillRegistry):
+    """创建 Planner 节点（从 registry 动态获取选项列表）"""
+
+    planner_options = registry.get_planner_options()
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """你是一个任务规划助手。根据用户的问题，决定需要执行哪些步骤。
+        ("system", f"""你是一个任务规划助手。根据用户的问题，决定需要执行哪些步骤。
 
 可选步骤：
-- legal_search: 搜索本地法律法规知识库（适合查法律条文、合同模板、劳动法等）
-- web_search: 联网搜索最新信息（适合查最新政策、新闻、行业动态等）
-- job_search: 搜索招聘信息（适合查职位、薪资、公司招聘等）
+{planner_options}
 
 规则：
 - 只输出需要的步骤，不要多余
@@ -69,7 +183,8 @@ def make_plan_node(llm):
             parsed = json.loads(cleaned)
             steps = parsed.get("steps", [])
 
-            valid_steps = {"legal_search", "web_search", "job_search"}
+            # 用 registry 验证步骤有效性
+            valid_steps = set(registry.get_all_skill_names())
             steps = [s for s in steps if s in valid_steps]
 
             if not steps:
@@ -97,13 +212,60 @@ def make_plan_node(llm):
     return plan
 
 
-def make_execute_node(retrieval_service: RetrievalService):
-    """创建执行节点（循环执行计划中的每一步）"""
+def make_execute_node(
+    retrieval_service: RetrievalService,
+    registry: SkillRegistry,
+    react_executor,
+):
+    """
+    创建执行节点 — 混合分发策略
+
+    分发逻辑：
+    1. legal_search → 特殊分支（依赖 retrieval_service）
+    2. 复杂 skill → ReAct Agent 自主推理执行
+    3. 简单 skill → 直接调用
+
+    Args:
+        retrieval_service: RetrievalService 实例
+        registry: SkillRegistry 实例
+        react_executor: make_react_step_executor 返回的函数
+    """
 
     def execute(state: AppState) -> Dict[str, Any]:
         plan = state.get("plan", [])
         current_step = state.get("current_step", 0)
         query = state["query"]
+        review_issues = state.get("review_issues", [])
+
+        # Review Agent 反馈了问题 → 重置步骤，构建反馈上下文
+        if review_issues and current_step >= len(plan):
+            draft = state.get("draft_answer", "")
+            issues_text = "\n".join(f"- {issue}" for issue in review_issues)
+            feedback_context = (
+                f"\n\n【Review Agent 发现的问题】\n{issues_text}\n\n"
+                f"【上次错误输出（供参考，避免重复错误）】\n{draft[:500]}\n\n"
+                f"请针对上述问题修正，不要重复同样的错误。"
+            )
+            print(f"🔄 [ResearchAgent:execute] Review Agent 反馈问题，重新执行全部步骤...")
+            print(f"   具体问题: {review_issues}")
+            # 重置步骤 + 存储反馈上下文 + 清空 review_issues
+            current_step = 0
+            return {
+                "current_step": 0,
+                "review_issues": [],
+                "review_feedback": feedback_context,
+                "tool_history": state.get("tool_history", []) + [{
+                    "step": "execute_retry_start",
+                    "tool": "feedback",
+                    "input": issues_text,
+                    "timestamp": time.time(),
+                }],
+            }
+
+        # 追加反馈上下文到 query（每个子任务都能看到）
+        feedback = state.get("review_feedback", "")
+        if feedback:
+            query = query + feedback
 
         if current_step >= len(plan):
             return {"status": "executed"}
@@ -112,36 +274,64 @@ def make_execute_node(retrieval_service: RetrievalService):
         print(f"⚡ [ResearchAgent:execute] 步骤 {current_step + 1}/{len(plan)}: {step_name}")
 
         result = ""
-        if step_name == "legal_search":
-            result = retrieval_service.retrieve_as_string(query)
-            updates = {
-                "law_context": result,
-                "current_step": current_step + 1,
-            }
-        elif step_name == "web_search":
-            result = web_search(query)
-            updates = {
+        try:
+            if step_name == "legal_search":
+                # 特殊分支：检索服务（不是 skill，直接调用 retrieval_service）
+                result = retrieval_service.retrieve_as_string(query)
+                return {
+                    "law_context": result,
+                    "current_step": current_step + 1,
+                    "tool_history": state.get("tool_history", []) + [{
+                        "step": f"execute_{step_name}",
+                        "tool": step_name,
+                        "input": query,
+                        "output_len": len(result),
+                        "timestamp": time.time(),
+                    }],
+                }
+
+            elif registry.is_complex(step_name):
+                # 复杂 step：ReAct Agent 自主推理（可调用检索 + skill 工具）
+                result = react_executor(step_name, query)
+
+            else:
+                # 简单 step：直接调用 skill 函数
+                skill_fn = registry.get_skill_fn(step_name)
+                if skill_fn:
+                    result = skill_fn(query)
+                else:
+                    result = f"未知步骤: {step_name}，已跳过。"
+                    print(f"⚠️ [ResearchAgent:execute] 未注册的 skill: {step_name}")
+
+            # 统一返回（简单 + 复杂 step 共用）
+            return {
+                "skill_outputs": {**state.get("skill_outputs", {}), step_name: result},
                 "search_results": state.get("search_results", []) + [result],
                 "current_step": current_step + 1,
+                "tool_history": state.get("tool_history", []) + [{
+                    "step": f"execute_{step_name}",
+                    "tool": step_name,
+                    "input": query,
+                    "output_len": len(result),
+                    "timestamp": time.time(),
+                }],
             }
-        elif step_name == "job_search":
-            result = job_search(query)
-            updates = {
-                "search_results": state.get("search_results", []) + [result],
+
+        except Exception as e:
+            # 错误隔离：单个 step 失败不崩溃
+            error_msg = f"步骤 {step_name} 执行失败: {str(e)}"
+            print(f"❌ [ResearchAgent:execute] {error_msg}")
+            return {
+                "skill_outputs": {**state.get("skill_outputs", {}), step_name: error_msg},
                 "current_step": current_step + 1,
+                "tool_history": state.get("tool_history", []) + [{
+                    "step": f"execute_{step_name}",
+                    "tool": step_name,
+                    "input": query,
+                    "error": str(e),
+                    "timestamp": time.time(),
+                }],
             }
-        else:
-            updates = {"current_step": current_step + 1}
-
-        updates["tool_history"] = state.get("tool_history", []) + [{
-            "step": f"execute_{step_name}",
-            "tool": step_name,
-            "input": query,
-            "output_len": len(result) if result else 0,
-            "timestamp": time.time(),
-        }]
-
-        return updates
 
     return execute
 
@@ -156,11 +346,22 @@ def check_more_tasks(state: AppState) -> str:
 
 
 def make_synthesize_node(llm):
-    """创建合成节点"""
+    """创建合成节点
+
+    首次运行时直接合成；Review Agent 发现问题重跑时，
+    会把 review_issues 拼入 question，让 LLM 知道上次哪里有问题并修正。
+    """
     synthesis_chain = create_synthesis_chain(llm)
 
     async def synthesize(state: AppState) -> Dict[str, Any]:
-        print(f"📝 [ResearchAgent:synthesize] 生成最终答案...")
+        review_issues = state.get("review_issues", [])
+        is_retry = bool(review_issues)
+
+        if is_retry:
+            print(f"🔄 [ResearchAgent:synthesize] Review Agent 反馈问题，重新合成...")
+            print(f"   具体问题: {review_issues}")
+        else:
+            print(f"📝 [ResearchAgent:synthesize] 生成最终答案...")
 
         context_parts = []
         if state.get("law_context"):
@@ -169,19 +370,31 @@ def make_synthesize_node(llm):
             context_parts.append(f"【搜索结果 {i+1}】\n{sr}")
         context = "\n\n".join(context_parts) if context_parts else "无参考资料"
 
+        # 拼接 question：首次直接用 query，重试时附带 Review Agent 的问题反馈
+        question = state["query"]
+        if is_retry:
+            issues_text = "\n".join(f"- {issue}" for issue in review_issues)
+            question += (
+                f"\n\n{RETRY_PROMPT_SUFFIX}"
+                f"\n\n【Review Agent 发现的具体问题】\n{issues_text}"
+                f"\n\n请针对上述问题修正你的回答。"
+            )
+
         result = await synthesis_chain.ainvoke({
             "history": state.get("history", ""),
             "context": context,
-            "question": state["query"],
+            "question": question,
         })
 
+        step_name = "synthesize_retry" if is_retry else "synthesize"
         return {
             "draft_answer": result,
             "final_answer": result,
+            "review_retry": state.get("review_retry", 0) + (1 if is_retry else 0),
             "tool_history": state.get("tool_history", []) + [{
-                "step": "synthesize",
+                "step": step_name,
                 "tool": "synthesis_chain",
-                "input": state["query"],
+                "input": question[:200],
                 "output_len": len(result),
                 "timestamp": time.time(),
             }],
@@ -190,76 +403,36 @@ def make_synthesize_node(llm):
     return synthesize
 
 
-def make_re_synthesize_node(synthesis_chain):
-    """创建重试合成节点（带增强提示）"""
-
-    RETRY_PROMPT_SUFFIX = (
-        "\n\n【重要】请严格基于提供的参考资料回答，"
-        "不要引用未在参考资料中出现的法律名称和条文号。"
-        "如果参考资料中没有相关信息，请用概括性表述。"
-    )
-
-    async def re_synthesize(state: AppState) -> Dict[str, Any]:
-        print(f"🔄 [ResearchAgent:re_synthesize] Review Agent 发现问题，重新生成...")
-
-        context_parts = []
-        if state.get("law_context"):
-            context_parts.append(f"【法律法规】\n{state['law_context']}")
-        for i, sr in enumerate(state.get("search_results", [])):
-            context_parts.append(f"【搜索结果 {i+1}】\n{sr}")
-        context = "\n\n".join(context_parts) if context_parts else "无参考资料"
-
-        result = await synthesis_chain.ainvoke({
-            "history": state.get("history", ""),
-            "context": context,
-            "question": state["query"] + RETRY_PROMPT_SUFFIX,
-        })
-
-        return {
-            "draft_answer": result,
-            "final_answer": result,
-            "review_retry": state.get("review_retry", 0) + 1,
-            "tool_history": state.get("tool_history", []) + [{
-                "step": "re_synthesize",
-                "tool": "synthesis_chain_retry",
-                "input": state["query"],
-                "output_len": len(result),
-                "timestamp": time.time(),
-            }],
-        }
-
-    return re_synthesize
-
-
 # ==================== 图构建 ====================
 
 def create_research_agent_graph(
     llm,
     retrieval_service: RetrievalService,
+    registry: SkillRegistry,
+    react_executor=None,
 ):
     """
     创建研究型任务 workflow 图
 
-    动态流程：plan → execute (循环) → synthesize → review → END
-    Review Agent 发现引用问题时：review → re_synthesize → review → END
+    混合策略：Plan-and-Execute（全局规划） + ReAct（复杂 step 内灵活执行）。
 
-    Planner 根据用户问题自动决定使用哪些工具。
-    适用场景：法律对比、求职搜索、行业研究等需要多步推理的任务。
+    流程：plan → execute (循环) → synthesize → review → END
+    Review Agent 发现引用问题时：review → execute（带上问题反馈）→ synthesize → review → END
 
     Args:
         llm: LangChain LLM 实例
         retrieval_service: RetrievalService 实例
+        registry: SkillRegistry 实例
+        react_executor: ReAct 执行器（可选，不传则所有 step 都直接调用）
 
     Returns:
         编译好的 LangGraph graph
     """
-    synthesis_chain = create_synthesis_chain(llm)
-
-    plan_node = make_plan_node(llm)
-    execute_node = make_execute_node(retrieval_service)
+    plan_node = make_plan_node(llm, registry)
+    execute_node = make_execute_node(retrieval_service, registry, react_executor)
     synthesize_node = make_synthesize_node(llm)
     review_node = create_review_agent_node(llm)
-    re_synthesize_node = make_re_synthesize_node(synthesis_chain)
+    remove_node = create_remove_citations_node(llm)
 
     workflow = StateGraph(AppState)
 
@@ -267,7 +440,7 @@ def create_research_agent_graph(
     workflow.add_node("execute", execute_node)
     workflow.add_node("synthesize", synthesize_node)
     workflow.add_node("review", review_node)
-    workflow.add_node("re_synthesize", re_synthesize_node)
+    workflow.add_node("remove_citations", remove_node)
 
     workflow.set_entry_point("plan")
     workflow.add_edge("plan", "execute")
@@ -284,10 +457,11 @@ def create_research_agent_graph(
         "review",
         check_review_result,
         {
-            "revise": "re_synthesize",
+            "revise": "execute",
+            "remove": "remove_citations",
             "approve": END,
         },
     )
-    workflow.add_edge("re_synthesize", "review")
+    workflow.add_edge("remove_citations", END)
 
     return workflow.compile()

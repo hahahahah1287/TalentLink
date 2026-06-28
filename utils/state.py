@@ -54,13 +54,15 @@ class AppState(TypedDict, total=False):
     final_answer: str
     citations: List[str]
 
+    # === Skill 结构化输出 ===
+    skill_outputs: Dict[str, str]  # skill_name -> result（保留结构化数据）
+
     # === 合规 ===
     policy_flags: List[str]
     status: str             # "running" | "done" | "error"
-    citation_retry: int     # 引用验证重试次数（旧，保留兼容）
-    citation_issues: List[str]  # 引用验证发现的问题（旧，保留兼容）
 
     # === Review Agent ===
     review_status: str      # "approve" | "revise" — Review Agent 审查结果
     review_issues: List[str]  # Review Agent 发现的问题
     review_retry: int       # Review Agent 重试次数
+    review_feedback: str    # Review Agent 反馈的具体问题上下文（execute 重跑时注入）

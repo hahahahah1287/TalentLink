@@ -160,6 +160,20 @@ async def system_metrics():
     return {"error": "service not initialized"}
 
 
+@app.post("/cache/invalidate", summary="清除 Workflow Checkpoint 缓存")
+async def invalidate_cache(workflow: Optional[str] = None):
+    """
+    手动清除 checkpoint 缓存。
+
+    Args:
+        workflow: 指定工作流类型 ("contract" / "research")，不传则清除全部
+    """
+    if workflow_service:
+        workflow_service.checkpoint.invalidate_all(workflow)
+        return {"status": "ok", "cleared_workflow": workflow or "all"}
+    return {"error": "service not initialized"}
+
+
 # ==================== 入口 ====================
 
 if __name__ == "__main__":

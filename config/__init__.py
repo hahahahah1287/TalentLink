@@ -103,6 +103,9 @@ class AppConfig:
     # 分词器类型: legal / contract / general
     text_splitter_type: str = "legal"
 
+    # Workflow Checkpoint 缓存 TTL（秒），0 表示禁用
+    checkpoint_ttl: int = 3600
+
     def to_dict(self) -> Dict[str, Any]:
         """导出为字典，方便日志记录"""
         return {

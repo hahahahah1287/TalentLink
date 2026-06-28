@@ -210,7 +210,7 @@ class CitationGuard(BaseGuard):
     如果 LLM 引用了一条检索结果里没有的法律，标记为疑似幻觉。
 
     工作原理：
-    1. 从 LLM 输出中提取法律引用（《法律名》第X条）
+    1. 从 LLM 输出中提取法律引用（《法律名》第X条 / 第三十八条）
     2. 在检索上下文中查找这些引用
     3. 未找到的引用 → 标记为疑似幻觉
 
@@ -220,8 +220,48 @@ class CitationGuard(BaseGuard):
 
     # 提取《法律名》
     LAW_NAME_PATTERN = re.compile(r'《([^》]+)》')
-    # 提取第X条
+    # 提取阿拉伯数字条文号：第38条
     ARTICLE_PATTERN = re.compile(r'第(\d+)条')
+    # 提取中文数字条文号：第三十八条、第十二条
+    ARTICLE_CN_PATTERN = re.compile(r'第([一二三四五六七八九十百千零]+)条')
+
+    # 中文数字 → 阿拉伯数字映射
+    CN_NUM_MAP = {
+        '零': 0, '一': 1, '二': 2, '三': 3, '四': 4,
+        '五': 5, '六': 6, '七': 7, '八': 8, '九': 9,
+        '十': 10, '百': 100, '千': 1000, '万': 10000,
+    }
+
+    @classmethod
+    def _cn_to_arabic(cls, cn_str: str) -> int:
+        """中文数字转阿拉伯数字：三十八 → 38，十二 → 12"""
+        result = 0
+        temp = 0
+        for char in cn_str:
+            val = cls.CN_NUM_MAP.get(char)
+            if val is None:
+                continue
+            if val >= 10:  # 十、百、千、万
+                if temp == 0:
+                    temp = 1  # "十" 前面没数字时当作 1（如"十二"= 12）
+                result += temp * val
+                temp = 0
+            else:
+                temp = val
+        result += temp
+        return result
+
+    @classmethod
+    def _normalize_articles(cls, text: str) -> set:
+        """从文本中提取所有条文号，统一为阿拉伯数字集合"""
+        articles = set()
+        # 阿拉伯数字：第38条
+        for num in cls.ARTICLE_PATTERN.findall(text):
+            articles.add(int(num))
+        # 中文数字：第三十八条
+        for cn_num in cls.ARTICLE_CN_PATTERN.findall(text):
+            articles.add(cls._cn_to_arabic(cn_num))
+        return articles
 
     def process(self, text: str, context: Optional[dict] = None) -> GuardResult:
         law_context = (context or {}).get("law_context", "")
@@ -241,18 +281,19 @@ class CitationGuard(BaseGuard):
                 if law_name not in law_context:
                     warnings.append(f"《{law_name}》未在检索结果中找到")
 
-        # 2. 检查条文号引用（只在有法律名引用时才检查条文号）
-        # 如果 LLM 说"第38条"但检索结果里没有第38条的内容，可能是编造
-        cited_articles = set(self.ARTICLE_PATTERN.findall(text))
-        if cited_articles and len(cited_articles) >= 3:
-            # 如果引用了 3 条以上条文，抽查是否有对应内容
-            missing_count = 0
+        # 2. 检查条文号引用（每条引用都检查，不分中文/阿拉伯数字）
+        cited_articles = self._normalize_articles(text)
+        context_articles = self._normalize_articles(law_context)
+
+        if cited_articles:
+            missing = []
             for article_num in cited_articles:
-                # 在检索结果中查找该条文号
-                if f"第{article_num}条" not in law_context:
-                    missing_count += 1
-            if missing_count > 0 and missing_count >= len(cited_articles) // 2:
-                warnings.append(f"引用了{len(cited_articles)}个条文，其中{missing_count}个未在检索结果中找到")
+                if article_num not in context_articles:
+                    missing.append(f"第{article_num}条")
+            if missing:
+                warnings.append(
+                    f"以下条文未在检索结果中找到：{'、'.join(missing)}"
+                )
 
         if warnings:
             detail_str = "; ".join(warnings)
