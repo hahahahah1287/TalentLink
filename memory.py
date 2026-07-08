@@ -600,8 +600,9 @@ class ChatHistoryManager:
         标题生成在后台异步执行，不阻塞主线程。
         """
         if session_id:
+            self.assert_session_access(user_id, session_id)
             return session_id
-        
+
         new_session_id = str(uuid.uuid4())
         
         # 先用默认标题创建会话（不阻塞）
@@ -622,7 +623,21 @@ class ChatHistoryManager:
             ).start()
         
         return new_session_id
-    
+
+    def assert_session_access(self, user_id: str, session_id: str):
+        """校验会话归属，防止客户端伪造 session_id 读取他人历史。"""
+        with self.db_pool.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT user_id FROM sessions WHERE session_id = %s",
+                    (session_id,)
+                )
+                row = cursor.fetchone()
+        if not row:
+            raise ValueError("会话不存在或已失效")
+        if row.get("user_id") != user_id:
+            raise PermissionError("无权访问该会话")
+
     def _async_generate_title(self, session_id: str, query: str):
         """后台异步生成标题"""
         try:

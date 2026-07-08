@@ -37,7 +37,7 @@ class WorkflowCheckpoint:
         checkpoint = WorkflowCheckpoint(redis_client)
 
         # 检查缓存
-        cached = checkpoint.get("contract", query)
+        cached = checkpoint.get("legal", query)
         if cached:
             return cached
 
@@ -45,7 +45,7 @@ class WorkflowCheckpoint:
         result = await graph.ainvoke(state)
 
         # 写入缓存
-        checkpoint.set("contract", query, result)
+        checkpoint.set("legal", query, result)
     """
 
     # 缓存 key 前缀
@@ -74,10 +74,13 @@ class WorkflowCheckpoint:
         self._hits = 0
         self._misses = 0
 
-    def _make_key(self, workflow: str, query: str) -> str:
-        """生成缓存键"""
-        # 用 query 的 hash 作为 key，避免 key 过长
-        query_hash = hashlib.md5(query.encode("utf-8")).hexdigest()[:16]
+    def _make_key(self, workflow: str, query: Any) -> str:
+        """生成缓存键；query 可为原始字符串或结构化 request fingerprint。"""
+        if isinstance(query, dict):
+            key_payload = json.dumps(query, ensure_ascii=False, sort_keys=True)
+        else:
+            key_payload = str(query)
+        query_hash = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()[:24]
         return f"{self.KEY_PREFIX}:{workflow}:{query_hash}"
 
     def get(self, workflow: str, query: str) -> Optional[Dict[str, Any]]:
@@ -85,7 +88,7 @@ class WorkflowCheckpoint:
         查询缓存
 
         Args:
-            workflow: 工作流类型 ("contract" / "research")
+            workflow: 工作流类型（统一为 "legal"）
             query: 用户查询
 
         Returns:
@@ -137,10 +140,9 @@ class WorkflowCheckpoint:
         # 提取需要缓存的字段（不缓存中间状态）
         cache_data = {
             "final_answer": final_answer,
-            "review_status": result.get("review_status", "approve"),
-            "review_issues": result.get("review_issues", []),
             "tool_history": result.get("tool_history", []),
             "law_context": result.get("law_context", ""),
+            "evidence_items": result.get("evidence_items", []),
             "cached_at": time.time(),
         }
 

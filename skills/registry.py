@@ -2,10 +2,15 @@
 """
 Skill Registry — 技能注册表
 
-统一管理所有 skills 的注册、发现和调用。
-添加新 skill 只需一行 registry.register(...)，无需修改 Planner、execute 节点或其他文件。
+统一登记法务 skill 的元信息，供确定性法务图的 run_skills 节点按名查找调用。
+
+与旧版的区别：
+- 不再服务于 LLM Planner（已删），因此去掉 get_planner_options / complexity 等
+  "供 9B 自由调度"的概念。
+- 注册时显式声明 skill 是否消费检索到的法条（uses_law_context），run_skills 据此传参，
+  避免直调 skill 时把 law_context 丢掉。
 """
-from typing import Callable, Optional
+from typing import Callable, Optional, Dict, List
 
 
 class SkillRegistry:
@@ -13,53 +18,47 @@ class SkillRegistry:
     技能注册表
 
     职责：
-    - 注册 skill（名称 → 实现函数 + 描述）
-    - 按名称查找 skill 函数
-    - 生成 Planner prompt 用的选项列表
-    - 提供所有 skill 的 LangChain Tool 列表
+    - 登记 skill（名称 → 统一接口函数 fn(query, law_context="") + 元信息）
+    - 按名称查找 skill 函数 / 是否消费 law_context / 展示标题
 
     使用方式：
         registry = SkillRegistry()
-        registry.register("risk_clause_detector", skill_fn, "风险条款识别")
-
-        # 在 Planner prompt 中使用
-        options = registry.get_planner_options()
-
-        # 在 execute 节点中动态调用
-        fn = registry.get_skill_fn(step_name)
-        if fn:
-            result = fn(query)
+        registry.register(
+            "compliance_check", compliance_skill,
+            "劳动法合规检查", uses_law_context=True, label="合规检查",
+        )
+        fn = registry.get_skill_fn("compliance_check")
     """
 
     def __init__(self):
-        self._skills: dict[str, dict] = {}
+        self._skills: Dict[str, dict] = {}
 
     def register(
         self,
         name: str,
-        fn: Callable[[str], str],
+        fn: Callable[..., str],
         description: str,
-        category: str = "legal",
-        complexity: str = "simple",
+        uses_law_context: bool = False,
+        label: Optional[str] = None,
     ) -> None:
         """
         注册一个 skill
 
         Args:
             name: 唯一标识（如 "risk_clause_detector"）
-            fn: 统一接口函数 fn(query: str) -> str
-            description: 供 Planner 理解的功能描述
-            category: 分类（"legal" | "search" | "utility"）
-            complexity: 复杂度（"simple" 直接调用 | "complex" 需要 ReAct 执行）
+            fn: 统一接口函数 fn(query: str, law_context: str = "") -> str
+            description: 功能描述（文档/调试用）
+            uses_law_context: 调用时是否需要把检索到的法条透传进去
+            label: 给合成 LLM 的中文小标题（默认用 name）
         """
         self._skills[name] = {
             "fn": fn,
             "description": description,
-            "category": category,
-            "complexity": complexity,
+            "uses_law_context": uses_law_context,
+            "label": label or name,
         }
 
-    def get_skill_fn(self, name: str) -> Optional[Callable[[str], str]]:
+    def get_skill_fn(self, name: str) -> Optional[Callable[..., str]]:
         """获取 skill 的实现函数"""
         entry = self._skills.get(name)
         return entry["fn"] if entry else None
@@ -69,39 +68,23 @@ class SkillRegistry:
         entry = self._skills.get(name)
         return entry["description"] if entry else None
 
-    def get_all_skill_names(self) -> list[str]:
+    def uses_law_context(self, name: str) -> bool:
+        """该 skill 是否消费检索到的法条"""
+        entry = self._skills.get(name)
+        return bool(entry and entry["uses_law_context"])
+
+    def get_label(self, name: str) -> Optional[str]:
+        """获取 skill 的展示标题"""
+        entry = self._skills.get(name)
+        return entry["label"] if entry else None
+
+    def get_all_skill_names(self) -> List[str]:
         """获取所有已注册的 skill 名称"""
         return list(self._skills.keys())
-
-    def get_planner_options(self) -> str:
-        """
-        生成 Planner prompt 用的选项列表
-
-        返回格式：
-            - risk_clause_detector: 识别合同中的风险条款...
-            - compliance_check: 检查用工场景是否合法...
-        """
-        lines = []
-        for name, info in self._skills.items():
-            lines.append(f"- {name}: {info['description']}")
-        return "\n".join(lines)
 
     def is_registered(self, name: str) -> bool:
         """检查 skill 是否已注册"""
         return name in self._skills
-
-    def is_complex(self, name: str) -> bool:
-        """判断某个 skill 是否需要 ReAct 执行"""
-        entry = self._skills.get(name)
-        return entry.get("complexity", "simple") == "complex" if entry else False
-
-    def get_complex_skills(self) -> list[str]:
-        """返回需要 ReAct 执行的复杂 skill 名称"""
-        return [name for name, info in self._skills.items() if info.get("complexity") == "complex"]
-
-    def get_simple_skills(self) -> list[str]:
-        """返回直接调用的简单 skill 名称"""
-        return [name for name, info in self._skills.items() if info.get("complexity", "simple") == "simple"]
 
     def __len__(self) -> int:
         return len(self._skills)

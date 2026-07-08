@@ -410,6 +410,7 @@ def create_research_agent_graph(
     retrieval_service: RetrievalService,
     registry: SkillRegistry,
     react_executor=None,
+    checkpointer=None,
 ):
     """
     创建研究型任务 workflow 图
@@ -424,6 +425,7 @@ def create_research_agent_graph(
         retrieval_service: RetrievalService 实例
         registry: SkillRegistry 实例
         react_executor: ReAct 执行器（可选，不传则所有 step 都直接调用）
+        checkpointer: LangGraph Checkpointer（用于断点恢复）
 
     Returns:
         编译好的 LangGraph graph
@@ -464,4 +466,4 @@ def create_research_agent_graph(
     )
     workflow.add_edge("remove_citations", END)
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)

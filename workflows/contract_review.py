@@ -101,6 +101,7 @@ def make_analyze_node(contract_chain):
 def create_contract_review_graph(
     llm,
     retrieval_service: RetrievalService,
+    checkpointer=None,
 ):
     """
     创建合同审查 workflow 图
@@ -111,6 +112,7 @@ def create_contract_review_graph(
     Args:
         llm: LangChain LLM 实例
         retrieval_service: RetrievalService 实例
+        checkpointer: LangGraph Checkpointer（用于断点恢复）
 
     Returns:
         编译好的 LangGraph graph
@@ -143,4 +145,4 @@ def create_contract_review_graph(
     )
     workflow.add_edge("remove_citations", END)
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)

@@ -1,0 +1,100 @@
+{
+  "_meta": {
+    "description": "劳动法合规检查决策表（Rules-as-Data）。规则与代码分离，可热更新、可度量覆盖。",
+    "version": "1.0",
+    "rule_schema": {
+      "id": "规则唯一编号",
+      "dimension": "合规维度",
+      "field": "被检字段（来自结构化场景抽取）",
+      "op": "比较算子: gt/gte/lt/lte/eq/ne/in/true/false",
+      "threshold": "法定阈值",
+      "verdict_violate": "命中即违规的判定文案",
+      "legal_basis": "法律依据",
+      "suggestion": "整改建议",
+      "condition": "可选：前置条件字段(仅当满足时才评估本规则)"
+    }
+  },
+  "rules": [
+    {
+      "id": "R-PROB-01",
+      "dimension": "试用期",
+      "field": "probation_months",
+      "op": "gt",
+      "threshold": 6,
+      "verdict_violate": "试用期超过法定上限 6 个月",
+      "legal_basis": "《劳动法》第21条",
+      "suggestion": "试用期最长不得超过 6 个月，超出部分无效。"
+    },
+    {
+      "id": "R-PROB-02",
+      "dimension": "试用期",
+      "field": "probation_wage_ratio",
+      "op": "lt",
+      "threshold": 0.8,
+      "verdict_violate": "试用期工资低于转正工资的 80%",
+      "legal_basis": "劳动法律法规关于试用期工资下限的规定",
+      "suggestion": "试用期工资不得低于本单位相同岗位最低工资或劳动合同约定工资的 80%。"
+    },
+    {
+      "id": "R-OT-01",
+      "dimension": "加班",
+      "field": "daily_overtime_hours",
+      "op": "gt",
+      "threshold": 3,
+      "verdict_violate": "每日延长工作时间超过 3 小时上限",
+      "legal_basis": "《劳动法》第41条",
+      "suggestion": "因特殊原因每日延长工作时间最多 3 小时。"
+    },
+    {
+      "id": "R-OT-02",
+      "dimension": "加班",
+      "field": "monthly_overtime_hours",
+      "op": "gt",
+      "threshold": 36,
+      "verdict_violate": "每月加班时间超过 36 小时上限",
+      "legal_basis": "《劳动法》第41条",
+      "suggestion": "每月延长工作时间不得超过 36 小时。"
+    },
+    {
+      "id": "R-OT-03",
+      "dimension": "加班",
+      "field": "overtime_pay_provided",
+      "op": "false",
+      "threshold": null,
+      "verdict_violate": "安排加班但未支付加班费（仅调休不能替代法定加班费）",
+      "legal_basis": "《劳动法》第44条",
+      "suggestion": "延长工作时间应支付不低于 150%/200%/300% 的加班费。"
+    },
+    {
+      "id": "R-SI-01",
+      "dimension": "社保",
+      "field": "social_insurance_paid",
+      "op": "false",
+      "threshold": null,
+      "verdict_violate": "未依法为劳动者缴纳社会保险",
+      "legal_basis": "《劳动法》第72条",
+      "suggestion": "用人单位和劳动者必须依法参加社会保险、缴纳社保费，不得放弃。"
+    },
+    {
+      "id": "R-WAGE-01",
+      "dimension": "工资",
+      "field": "below_minimum_wage",
+      "op": "true",
+      "threshold": null,
+      "verdict_violate": "工资低于当地最低工资标准",
+      "legal_basis": "《劳动法》第48条",
+      "suggestion": "支付的工资不得低于当地最低工资标准（不含加班费、特殊津贴）。"
+    },
+    {
+      "id": "R-TERM-01",
+      "dimension": "解除合同",
+      "field": "termination_notice_days",
+      "op": "lt",
+      "threshold": 30,
+      "verdict_violate": "依据第26条解除但未提前 30 日书面通知",
+      "legal_basis": "《劳动法》第26条",
+      "suggestion": "无过失性解除应提前 30 日书面通知，或额外支付一个月工资（代通知金）。",
+      "condition": "termination_type_no_fault"
+    }
+  ]
+}

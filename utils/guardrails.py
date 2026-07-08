@@ -16,6 +16,8 @@ import re
 from typing import List, Optional, Callable
 from dataclasses import dataclass, field
 
+from utils.evidence import evidence_article_numbers, evidence_citations, evidence_law_titles
+
 
 @dataclass
 class GuardResult:
@@ -148,7 +150,7 @@ class DisclaimerGuard(BaseGuard):
 
         # 也可通过 context 中的 intent 判断
         intent = (context or {}).get("intent", "")
-        is_legal_intent = intent in ("job_search", "contract_critique")
+        is_legal_intent = intent in ("legal", "contract")
 
         if contains_legal or is_legal_intent:
             return GuardResult(
@@ -264,36 +266,62 @@ class CitationGuard(BaseGuard):
         return articles
 
     def process(self, text: str, context: Optional[dict] = None) -> GuardResult:
-        law_context = (context or {}).get("law_context", "")
+        context = context or {}
+        law_context = context.get("law_context", "")
+        evidence_items = context.get("evidence_items", []) or []
 
         # 没有检索上下文时跳过验证（比如普通聊天场景）
-        if not law_context or len(law_context) < 10:
+        if not evidence_items and (not law_context or len(law_context) < 10):
             return GuardResult(output=text, guard_name=self.name)
 
         warnings = []
 
-        # 1. 检查法律名引用（仅当检索结果中也包含法律名时才检查）
-        # 如果检索结果只有条文内容没有法律名字符串，跳过法律名检查避免误报
         cited_laws = set(self.LAW_NAME_PATTERN.findall(text))
-        context_laws = set(self.LAW_NAME_PATTERN.findall(law_context))
-        if context_laws:
-            for law_name in cited_laws:
-                if law_name not in law_context:
-                    warnings.append(f"《{law_name}》未在检索结果中找到")
-
-        # 2. 检查条文号引用（每条引用都检查，不分中文/阿拉伯数字）
         cited_articles = self._normalize_articles(text)
-        context_articles = self._normalize_articles(law_context)
 
-        if cited_articles:
-            missing = []
-            for article_num in cited_articles:
-                if article_num not in context_articles:
-                    missing.append(f"第{article_num}条")
-            if missing:
-                warnings.append(
-                    f"以下条文未在检索结果中找到：{'、'.join(missing)}"
-                )
+        # 1. 优先使用结构化证据校验条文号
+        if evidence_items:
+            allowed_articles = evidence_article_numbers(evidence_items)
+            allowed_citations = evidence_citations(evidence_items)
+            allowed_laws = evidence_law_titles(evidence_items)
+            if cited_laws and allowed_laws:
+                missing_laws = []
+                for law_name in cited_laws:
+                    if law_name not in allowed_laws:
+                        missing_laws.append(f"《{law_name}》")
+                if missing_laws:
+                    warnings.append(
+                        f"以下法律未在本轮证据集中找到：{'、'.join(missing_laws)}"
+                    )
+            if cited_articles:
+                missing = []
+                for article_num in cited_articles:
+                    if article_num not in allowed_articles:
+                        missing.append(f"第{article_num}条")
+                if missing:
+                    allowed_text = "、".join(allowed_citations) or "本轮检索证据"
+                    warnings.append(
+                        f"以下条文未在本轮证据集中找到：{'、'.join(missing)}；允许引用：{allowed_text}"
+                    )
+        else:
+            # 兼容旧模式：检查法律名引用（仅当检索结果中也包含法律名时才检查）
+            context_laws = set(self.LAW_NAME_PATTERN.findall(law_context))
+            if context_laws:
+                for law_name in cited_laws:
+                    if law_name not in law_context:
+                        warnings.append(f"《{law_name}》未在检索结果中找到")
+
+            # 旧模式：检查条文号引用
+            context_articles = self._normalize_articles(law_context)
+            if cited_articles:
+                missing = []
+                for article_num in cited_articles:
+                    if article_num not in context_articles:
+                        missing.append(f"第{article_num}条")
+                if missing:
+                    warnings.append(
+                        f"以下条文未在检索结果中找到：{'、'.join(missing)}"
+                    )
 
         if warnings:
             detail_str = "; ".join(warnings)
@@ -320,7 +348,7 @@ class GuardrailsPipeline:
 
     使用示例:
         pipeline = GuardrailsPipeline()
-        result = pipeline.run("这是AI的回复...", context={"intent": "job_search"})
+        result = pipeline.run("这是AI的回复...", context={"intent": "legal"})
         final_text = result["output"]
         print(result["guards_triggered"])  # 查看哪些 Guard 被触发
     """

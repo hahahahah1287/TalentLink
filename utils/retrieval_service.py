@@ -7,9 +7,11 @@
 HyDE 开关由 config.retrieval.hyde_enabled 统一控制，
 调用方可传 use_hyde=True/False 覆盖，传 None 则使用配置默认值。
 """
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from langchain.tools import tool
 from langchain_core.documents import Document
+
+from utils.evidence import documents_to_evidence, render_evidence_context
 
 
 class RetrievalService:
@@ -78,6 +80,28 @@ class RetrievalService:
             return reranked_docs
 
         return raw_docs[: self.top_k]
+
+    def retrieve_with_evidence(
+        self, query: str, use_hyde: Optional[bool] = None, separator: str = "\n\n"
+    ) -> Dict[str, Any]:
+        """
+        检索并返回结构化证据，供生成、guard 和审计链路复用。
+
+        Returns:
+            {
+              "docs": List[Document],
+              "evidence_items": List[dict],
+              "law_context": str,
+            }
+        """
+        docs = self.retrieve(query, use_hyde=use_hyde)
+        evidence_items = documents_to_evidence(docs)
+        law_context = render_evidence_context(evidence_items, separator=separator)
+        return {
+            "docs": docs,
+            "evidence_items": evidence_items,
+            "law_context": law_context,
+        }
 
     def retrieve_as_string(
         self, query: str, use_hyde: Optional[bool] = None, separator: str = "\n\n"

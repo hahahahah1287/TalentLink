@@ -45,8 +45,9 @@ class ChatRequest(BaseModel):
     user_id: str
     session_id: Optional[str] = None  # 新对话传 None
     query: str
-    scene: str = "chat"               # "contract" / "job" / "chat"
-    contract_text: Optional[str] = None  # 仅审合同时需要
+    scene: str = "legal"              # "legal"（法务问答/合同审查统一入口）| "chat"
+    # 合同文本可选：是否走合同审查由后端按内容特征判定，不依赖此字段（无 OCR）
+    contract_text: Optional[str] = None
 
 
 class HistoryResponse(BaseModel):
@@ -107,14 +108,13 @@ app.add_middleware(
 @app.post("/chat/stream", summary="流式对话接口")
 async def chat_stream(req: ChatRequest):
     """
-    主对话接口
+    主对话接口（单一确定性法务流水线）。
 
-    scene 参数决定走哪个 workflow：
-    - "contract" → 合同审查图
-    - "job"      → 研究型任务图（Planner 自动规划工具）
-    - "chat"     → 直接 LLM 对话
+    所有非闲聊请求都走同一条法务图：
+      安全检测 → 缓存 → 意图路由 → 检索法条 → 确定性 skill → 合成 → 输出防护。
+    是否合同审查由后端按内容特征自动判定（不依赖前端 scene/contract_text 声明）。
 
-    客户端应使用 EventSource 或 fetch 读取 SSE 流。
+    客户端应使用 EventSource 或 fetch 读取 SSE 流（data 帧为 JSON：{"text": "..."}）。
     """
     return StreamingResponse(
         workflow_service.process_request_stream(
@@ -152,7 +152,7 @@ async def health_check():
 @app.get("/metrics", summary="系统运行指标")
 async def system_metrics():
     """
-    暴露熔断器状态、语义缓存命中率等运行时指标。
+    暴露 checkpoint 缓存命中率等运行时指标。
     可对接 Prometheus/Grafana 监控。
     """
     if workflow_service:
@@ -166,7 +166,7 @@ async def invalidate_cache(workflow: Optional[str] = None):
     手动清除 checkpoint 缓存。
 
     Args:
-        workflow: 指定工作流类型 ("contract" / "research")，不传则清除全部
+        workflow: 指定工作流类型（默认 "legal"），不传则清除全部
     """
     if workflow_service:
         workflow_service.checkpoint.invalidate_all(workflow)

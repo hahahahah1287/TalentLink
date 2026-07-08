@@ -7,24 +7,51 @@ TalentLink 应用配置模块
 - Embedding 模型配置
 - 数据库连接配置
 - 上下文窗口参数
+- LLM-as-Judge 配置（从 .env 读取，避免 key 泄露）
 """
+import os
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
+
+from dotenv import load_dotenv
+
+# 从仓库根目录 .env 加载环境变量（.env 已在 .gitignore 中，不会进 git）
+load_dotenv()
 
 
 @dataclass
 class LLMConfig:
     """大语言模型配置"""
     # GGUF 模型路径
-    model_path: str = "./Qwen3.5-9B-Q5_K_M.gguf"
+    model_path: str = "./Qwen3.5-9B-IQ4_XS.gguf"
     # 上下文窗口
     n_ctx: int = 4096
     # GPU 层数 (-1 表示全部卸载到 GPU)
     n_gpu_layers: int = -1
-    
+
     # 参数
     temperature: float = 0.1
     verbose: bool = False
+
+@dataclass
+class JudgeConfig:
+    """LLM-as-Judge 配置（可选层，对应 RAGAS_TEST_PLAN.md §17.3）
+
+    从 .env 读取 API key，避免写进代码或推到 GitHub。
+    未配置时 is_configured=False，确定性评测核心仍可独立运行。
+    注意：刻意不放入 to_dict()，防止 key 被日志记录。
+    """
+    gemini_api_key: str = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY", ""))
+    openai_api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
+    openai_base_url: str = field(default_factory=lambda: os.environ.get("OPENAI_BASE_URL", ""))
+    judge_model: str = field(default_factory=lambda: os.environ.get("JUDGE_MODEL", "gemini-2.5-flash"))
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.gemini_api_key) or bool(
+            self.openai_api_key and self.openai_base_url
+        )
+
 
 @dataclass
 class EmbeddingConfig:
@@ -41,10 +68,11 @@ class DatabaseConfig:
     mysql_host: str = "localhost"
     mysql_port: int = 3306
     mysql_user: str = "root"
-    mysql_password: str = "123456"
+    # 建议在 .env 设 MYSQL_PASSWORD 覆盖此默认值，避免硬编码进 git
+    mysql_password: str = field(default_factory=lambda: os.environ.get("MYSQL_PASSWORD", "123456"))
     mysql_database: str = "talentlink"
     mysql_charset: str = "utf8mb4"
-    
+
     # Redis 配置
     redis_host: str = "localhost"
     redis_port: int = 6379
@@ -87,31 +115,30 @@ class RetrievalConfig:
 class AppConfig:
     """
     应用总配置
-    
+
     用法:
         config = AppConfig()
-        print(config.llm.main_model_path)
+        print(config.llm.model_path)
         print(config.database.mysql_host)
+        print(config.judge.is_configured)   # .env 是否填了 key
     """
     llm: LLMConfig = field(default_factory=LLMConfig)
+    judge: JudgeConfig = field(default_factory=JudgeConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
-    
-    # 分词器类型: legal / contract / general
-    text_splitter_type: str = "legal"
 
     # Workflow Checkpoint 缓存 TTL（秒），0 表示禁用
     checkpoint_ttl: int = 3600
 
     def to_dict(self) -> Dict[str, Any]:
-        """导出为字典，方便日志记录"""
+        """导出为字典，方便日志记录（刻意不含 judge，避免泄露 key）"""
         return {
             "llm": {
-                "model_name": self.llm.model_name,
-                "base_url": self.llm.base_url,
+                "model_path": self.llm.model_path,
+                "n_ctx": self.llm.n_ctx,
             },
             "embedding": {
                 "model": self.embedding.model_name,

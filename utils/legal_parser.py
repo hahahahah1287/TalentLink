@@ -9,6 +9,15 @@ import re
 from typing import List, Optional
 from langchain_core.documents import Document
 
+from utils.evidence import (
+    build_article_id,
+    build_canonical_citation,
+    extract_article_label,
+    normalize_article_number,
+    normalize_law_title,
+    stable_text_hash,
+)
+
 
 class LegalDocumentParser:
     """
@@ -72,14 +81,31 @@ class LegalDocumentParser:
                 if article_number == "未知条款":
                     continue
 
-                # 构建 Document
+                # 构建 Document：保留原字段，同时补充稳定证据身份
+                article_num = normalize_article_number(article_number)
+                article_label = extract_article_label(article_number, article_num)
+                law_info = normalize_law_title(self.current_law, source)
+                canonical_citation = build_canonical_citation(
+                    law_info["canonical_law_title"], article_label
+                )
                 doc = Document(
                     page_content=article_content,
                     metadata={
                         "law": self.current_law,
+                        "law_title": law_info["law_title"],
+                        "canonical_law_title": law_info["canonical_law_title"],
                         "chapter": self.current_chapter,
                         "article": article_number,
+                        "article_number": article_num,
+                        "article_label": article_label,
+                        "article_id": build_article_id(
+                            law_info["canonical_law_title"], article_num, source
+                        ),
+                        "canonical_citation": canonical_citation,
                         "source": source,
+                        "source_path": source,
+                        "source_type": "statute",
+                        "text_hash": stable_text_hash(article_content),
                     }
                 )
                 documents.append(doc)

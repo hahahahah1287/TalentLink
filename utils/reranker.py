@@ -150,11 +150,13 @@ class RerankService:
             zip(scores, doc_list), key=lambda x: x[0], reverse=True
         )
 
-        # 5. 可选：分数过滤
+        # 5. 可选：分数过滤；若阈值过高导致全空，回退到原始 top_k
         if score_threshold is not None:
-            scored_docs = [
-                (s, d) for s, d in scored_docs if s >= score_threshold
-            ]
+            filtered = [(s, d) for s, d in scored_docs if s >= score_threshold]
+            if filtered:
+                scored_docs = filtered
+            else:
+                print("⚠️ [Reranker] 阈值过滤结果为空，回退到未过滤 top_k")
 
         return [doc for _, doc in scored_docs[:top_k]]
 

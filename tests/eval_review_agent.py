@@ -1,30 +1,55 @@
 # -*- coding: utf-8 -*-
 """
-Review Agent 评估脚本（LangSmith，不需要 LLM Judge）
+确定性 Guardrails 评估（离线，无 LLM Judge / 无 LangSmith）
+
+评估对象已从旧的 Review ReAct Agent 改为确定性 guard 节点：
+    workflows.legal_graph.make_guard_node(GuardrailsPipeline())
+内部即 utils.guardrails.GuardrailsPipeline（PIIGuard→QualityGuard→CitationGuard→DisclaimerGuard）。
+
+本脚本本地直跑，零外部服务（不连 LangSmith、不起 WorkflowService），可在 CI 离线运行。
 
 评估指标：
-- Tool Call Accuracy：是否调用了正确的工具
-- Review Status Accuracy：approve/revise 判断是否正确
-- Completion Rate：是否在限定步骤内完成
+- Guard Accuracy：期望被触发的 guard 集合 ∩ 实际触发集合 / 期望集合
+- Status Accuracy：approve/revise 判断是否正确（revise = CitationGuard 触发重生成）
+- Completion Rate：是否产出最终结果（final_answer 或 revise 标记非空即完成）
 
 用法：
     python tests/eval_review_agent.py
     python tests/eval_review_agent.py --limit 5
 """
 import sys
-import json
+import asyncio
 import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from langsmith import Client
-from langsmith.evaluation import evaluate
+from workflows.legal_graph import make_guard_node
+from utils.guardrails import GuardrailsPipeline
 
-from workflow_service import WorkflowService
+
+# ==================== 旧工具名 → 确定性 guard 名映射 ====================
+#
+# 旧的 Review Agent 用 tools_called 表达期望（citation_check/add_disclaimer/
+# pii_check/quality_check）；确定性管线里对齐为各 Guard 的 guard_name 中文名。
+
+TOOL_TO_GUARD = {
+    "pii_check": "PII脱敏",
+    "citation_check": "引用验证",
+    "add_disclaimer": "免责声明",
+    "quality_check": "质量检查",
+}
+
+
+def _map_tools_to_guards(tools):
+    """把旧 expected 里的 tools_called 映射成确定性 guard 名集合。"""
+    return {TOOL_TO_GUARD[t] for t in tools if t in TOOL_TO_GUARD}
 
 
 # ==================== 测试数据集 ====================
+#
+# 沿用旧的 REVIEW_DATASET（approve / revise / PII / 引用编造 等好场景），
+# expected.tools_called 仍写旧工具名，评估时按 TOOL_TO_GUARD 映射成 guard 名。
 
 REVIEW_DATASET = [
     # --- 应该 approve 的案例 ---
@@ -136,159 +161,140 @@ REVIEW_DATASET = [
 ]
 
 
-# ==================== 评估函数 ====================
+# ==================== 单条评估（本地直跑 guard 节点） ====================
 
-def tool_accuracy_evaluator(run, example):
-    """评估工具调用准确性：是否调用了预期的工具"""
-    expected_tools = set(example.outputs.get("expected", {}).get("tools_called", []))
+async def _eval_one(guard, item: dict) -> dict:
+    """
+    对一条用例构造 state，调用确定性 guard 节点，解析实际 status / 触发的 guard。
 
-    # 从 run 的消息中提取实际调用的工具
-    actual_tools = set()
-    for msg in run.outputs.get("messages", []):
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tc in msg.tool_calls:
-                actual_tools.add(tc.get("name", "") if isinstance(tc, dict) else tc.name)
+    - revise 判定：guard 返回 dict 含非空 guard_issues ⇒ "revise"，否则 "approve"。
+    - 触发 guard 判定：
+        * approve 分支：guard 走完整 pipeline，从 tool_history 最后一条的
+          guards_triggered 取（make_guard_node 在 guard 历史项里存了名单）。
+        * revise 分支：触发的是 "引用验证"。
+    - completion：final_answer 非空 或 走了 revise（guard_issues 非空）即视为完成。
+    """
+    state = {
+        "draft_answer": item["input"]["draft"],
+        "law_context": item["input"].get("law_context", ""),
+        "query": "",
+        "tool_history": [],
+        "guard_issues": [],
+        "guard_retry": 0,
+    }
+    result = await guard(state)
 
-    # 计算准确率
-    if not expected_tools and not actual_tools:
-        return {"score": 1.0, "comment": "两者都无工具调用"}
+    # status
+    guard_issues = result.get("guard_issues", []) or []
+    is_revise = bool(guard_issues)
+    actual_status = "revise" if is_revise else "approve"
 
-    if not expected_tools:
-        return {"score": 0.0, "comment": f"不应调用工具但调用了: {actual_tools}"}
+    # 实际触发的 guard 集合
+    if is_revise:
+        actual_guards = {"引用验证"}
+    else:
+        actual_guards = set()
+        history = result.get("tool_history", []) or []
+        if history:
+            actual_guards = set(history[-1].get("guards_triggered", []) or [])
 
-    hits = expected_tools & actual_tools
-    score = len(hits) / len(expected_tools) if expected_tools else 0.0
+    # completion：拿到 final_answer 或走了 revise 都算完成
+    completed = bool(result.get("final_answer")) or is_revise
 
     return {
-        "score": score,
-        "comment": f"期望={sorted(expected_tools)}, 实际={sorted(actual_tools)}, 命中={sorted(hits)}",
+        "actual_status": actual_status,
+        "actual_guards": actual_guards,
+        "completed": completed,
     }
 
 
-def review_status_evaluator(run, example):
-    """评估审查状态判断是否正确"""
-    expected_status = example.outputs.get("expected", {}).get("review_status", "approve")
+def _score_one(item: dict, outcome: dict) -> dict:
+    """根据期望与实际结果计算单条命中情况。"""
+    expected = item["expected"]
+    expected_guards = _map_tools_to_guards(expected.get("tools_called", []))
+    expected_status = expected.get("review_status", "approve")
 
-    # 从 run 的输出中提取 review_status
-    actual_status = "approve"
-    for msg in run.outputs.get("messages", []):
-        if hasattr(msg, "content") and isinstance(msg.content, str):
-            if "[引用验证] 发现问题" in msg.content:
-                actual_status = "revise"
-                break
+    actual_guards = outcome["actual_guards"]
+    actual_status = outcome["actual_status"]
 
-    score = 1.0 if actual_status == expected_status else 0.0
+    # guard 命中率：期望 ∩ 实际 / 期望；期望为空时，实际也为空记 1.0，否则 0.0
+    if not expected_guards:
+        guard_score = 1.0 if not actual_guards else 0.0
+        hits = set()
+    else:
+        hits = expected_guards & actual_guards
+        guard_score = len(hits) / len(expected_guards)
+
+    status_score = 1.0 if actual_status == expected_status else 0.0
+    completion_score = 1.0 if outcome["completed"] else 0.0
+
     return {
-        "score": score,
-        "comment": f"期望={expected_status}, 实际={actual_status}",
+        "expected_guards": expected_guards,
+        "actual_guards": actual_guards,
+        "hits": hits,
+        "guard_score": guard_score,
+        "expected_status": expected_status,
+        "actual_status": actual_status,
+        "status_score": status_score,
+        "completion_score": completion_score,
     }
-
-
-def completion_evaluator(run, example):
-    """评估是否正常完成（没有异常/超时）"""
-    messages = run.outputs.get("messages", [])
-    if not messages:
-        return {"score": 0.0, "comment": "无输出消息"}
-
-    # 检查是否有最终 AI 回复
-    has_final = False
-    for msg in reversed(messages):
-        if hasattr(msg, "type") and msg.type == "ai" and msg.content and not getattr(msg, "tool_calls", None):
-            has_final = True
-            break
-        if isinstance(msg, dict) and msg.get("type") == "ai" and msg.get("content"):
-            has_final = True
-            break
-
-    if has_final:
-        return {"score": 1.0, "comment": f"正常完成，共 {len(messages)} 条消息"}
-    return {"score": 0.0, "comment": f"未找到最终回复，共 {len(messages)} 条消息"}
 
 
 # ==================== 主流程 ====================
 
 def main():
-    parser = argparse.ArgumentParser(description="Review Agent 评估")
+    parser = argparse.ArgumentParser(description="确定性 Guardrails 评估（离线）")
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
 
     dataset = REVIEW_DATASET[:args.limit] if args.limit > 0 else REVIEW_DATASET
 
     print(f"\n{'='*60}")
-    print(f"Review Agent 评估 — {len(dataset)} 条测试数据")
-    print(f"指标: Tool Accuracy + Status Accuracy + Completion")
+    print(f"确定性 Guardrails 评估 — {len(dataset)} 条测试数据（离线，无 LLM Judge / 无 LangSmith）")
+    print(f"指标: Guard Accuracy + Status Accuracy + Completion")
     print(f"{'='*60}\n")
 
-    # 1. 初始化 Review Agent
-    print("📦 初始化 WorkflowService...")
-    service = WorkflowService()
-    review_agent = service.contract_graph.nodes.get("review")
+    # 本地构造确定性 guard 节点（零外部服务）
+    guard = make_guard_node(GuardrailsPipeline())
 
-    # 2. 准备 LangSmith 数据集
-    client = Client()
+    guard_scores = []
+    status_scores = []
+    completion_scores = []
 
-    # 创建数据集
-    ds_name = "review-agent-eval"
-    try:
-        existing = client.read_dataset(dataset_name=ds_name)
-        print(f"📦 使用已有数据集: {ds_name}")
-        dataset_id = existing.id
-        # 清空旧数据
-        for ex in client.list_examples(dataset_id=dataset_id):
-            client.delete_example(ex.id)
-    except Exception:
-        dataset_obj = client.create_dataset(dataset_name=ds_name)
-        dataset_id = dataset_obj.id
-        print(f"📦 创建数据集: {ds_name}")
+    for idx, item in enumerate(dataset, 1):
+        outcome = asyncio.run(_eval_one(guard, item))
+        s = _score_one(item, outcome)
 
-    # 添加测试用例
-    for item in dataset:
-        client.create_example(
-            inputs={"draft": item["input"]["draft"], "law_context": item["input"]["law_context"]},
-            outputs={"expected": item["expected"]},
-            dataset_id=dataset_id,
+        guard_scores.append(s["guard_score"])
+        status_scores.append(s["status_score"])
+        completion_scores.append(s["completion_score"])
+
+        draft_preview = item["input"]["draft"][:30]
+        print(f"[{idx}/{len(dataset)}] {draft_preview}...")
+        print(
+            f"    status: 期望={s['expected_status']} 实际={s['actual_status']} "
+            f"({'✓' if s['status_score'] == 1.0 else '✗'})"
+        )
+        print(
+            f"    guard : 期望={sorted(s['expected_guards'])} 实际={sorted(s['actual_guards'])} "
+            f"命中={sorted(s['hits'])} (score={s['guard_score']:.2f})"
+        )
+        print(
+            f"    完成  : {'✓' if s['completion_score'] == 1.0 else '✗'}"
         )
 
-    # 3. 创建 Review Agent 节点（直接调用，不走整个图）
-    from workflows.review_agent import create_review_agent_node
-    review_node = create_review_agent_node(service.llm)
+    n = len(dataset) or 1
+    guard_accuracy = sum(guard_scores) / n
+    status_accuracy = sum(status_scores) / n
+    completion_rate = sum(completion_scores) / n
 
-    async def target(inputs: dict) -> dict:
-        """直接调用 Review Agent 节点"""
-        state = {
-            "draft_answer": inputs["draft"],
-            "law_context": inputs.get("law_context", ""),
-            "query": "",
-            "tool_history": [],
-            "review_status": "approve",
-            "review_issues": [],
-            "review_retry": 0,
-        }
-        result = await review_node(state)
-        return result
-
-    # 4. 运行评估
-    print(f"\n🔄 运行评估...\n")
-    results = evaluate(
-        target,
-        data=ds_name,
-        evaluators=[tool_accuracy_evaluator, review_status_evaluator, completion_evaluator],
-        client=client,
-    )
-
-    # 5. 输出结果
     print(f"\n{'='*60}")
     print(f"评估结果")
     print(f"{'='*60}")
-
-    df = results.to_pandas()
-    for col in ["tool_accuracy_evaluator", "review_status_evaluator", "completion_evaluator"]:
-        if col in df.columns:
-            mean_score = df[col].mean()
-            print(f"  {col}: {mean_score:.4f}")
-
+    print(f"  guard_accuracy : {guard_accuracy:.4f}")
+    print(f"  status_accuracy: {status_accuracy:.4f}")
+    print(f"  completion_rate: {completion_rate:.4f}")
     print(f"\n✅ 评估完成！")
-    service.shutdown()
 
 
 if __name__ == "__main__":

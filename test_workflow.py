@@ -149,6 +149,8 @@ async def test_full_workflow():
             query_rewriter=query_rewriter,
             top_k=config.reranker.top_k,
             rerank_enabled=config.retrieval.rerank_enabled,
+            score_threshold=config.reranker.score_threshold,
+            hyde_enabled=config.retrieval.hyde_enabled,
         )
 
         # 测试检索
@@ -165,61 +167,112 @@ async def test_full_workflow():
         return
 
     print("\n" + "=" * 60)
-    print("Phase 6: 测试合同审查图 (LangGraph)")
+    print("Phase 6: 构建统一法务图 (build_legal_graph)")
     print("=" * 60)
     t0 = time.time()
     try:
         from utils import GuardrailsPipeline
-        from workflows import create_contract_review_graph
+        from workflows import build_legal_graph, SkillSpec
+        from utils.intent_router import route_intent
+
+        # 真实 skill：先 init 再包成 SkillSpec（与 workflow_service.py 接线一致）
+        from skills.risk_clause_detector import (
+            risk_clause_skill, init_skill as init_risk_skill,
+        )
+        from skills.compliance_check import (
+            compliance_skill, init_skill as init_compliance_skill,
+        )
+        from skills.legal_term_explainer import (
+            legal_term_skill, init_skill as init_term_skill,
+        )
+        from skills.case_retriever import (
+            case_retriever_skill, init_skill as init_case_skill,
+        )
+
+        init_risk_skill(llm)
+        init_compliance_skill(llm)
+        init_term_skill(llm)
+        init_case_skill(embeddings)
+
+        # 统一接口 fn(query, law_context="") -> str；这里挂最小集合（合规 + 风险条款）
+        skill_specs = {
+            "risk_clause_detector": SkillSpec(
+                fn=risk_clause_skill, uses_law_context=False, label="合同风险条款",
+            ),
+            "compliance_check": SkillSpec(
+                fn=compliance_skill, uses_law_context=False, label="合规检查",
+            ),
+        }
 
         guardrails = GuardrailsPipeline()
-        contract_graph = create_contract_review_graph(llm, retrieval_service, guardrails)
+        # build_legal_graph 内部已自动 create_contract_chain / create_legal_qa_chain
+        graph = build_legal_graph(
+            llm=llm,
+            retrieval_service=retrieval_service,
+            skill_specs=skill_specs,
+            guardrails=guardrails,
+        )
+        print(f"  ✅ 统一法务图构建完成 ({time.time() - t0:.1f}s)")
 
-        state = {
-            "query": "试用期工资有什么规定？",
-            "contract_text": "甲方同意在试用期内支付乙方工资为每月3000元。",
+        # ---- 用例 A：合同审查（合同特征由 route_intent 按内容判定） ----
+        print("\n  --- 用例 A：合同审查 ---")
+        tA = time.time()
+        queryA = "这份合同的试用期约定是否合法？"
+        contractA = "甲方与乙方约定：试用期为6个月，劳动合同期限为1年。"
+        routeA = route_intent(queryA, contract_text=contractA)
+        print(f"  🧭 has_contract={routeA['has_contract']} skills={routeA['skills']}")
+
+        stateA = {
+            "conversation_id": "test-conv-A",
+            "user_id": "test-user",
+            "scene": "legal",
+            "query": queryA,
+            "contract_text": contractA,
             "history": "",
+            "has_contract": routeA["has_contract"],
+            "route_skills": routeA["skills"],
             "tool_history": [],
-            "policy_flags": [],
+            "skill_outputs": {},
             "status": "running",
+            "guard_issues": [],
+            "guard_retry": 0,
         }
+        resultA = await graph.ainvoke(stateA)
+        print(f"  ✅ 合同审查完成 ({time.time() - tA:.1f}s)")
+        print(f"  📄 final_answer 前 300 字: {(resultA.get('final_answer') or '')[:300]}...")
+        print(f"  📄 skill_outputs keys: {list((resultA.get('skill_outputs') or {}).keys())}")
+        print(f"  📄 law_context 非空: {bool(resultA.get('law_context'))}")
 
-        result = await contract_graph.ainvoke(state)
-        print(f"  ✅ 合同审查完成 ({time.time() - t0:.1f}s)")
-        print(f"  📄 状态: {result.get('status')}")
-        print(f"  📄 答案前 300 字: {result.get('final_answer', '')[:300]}...")
+        # ---- 用例 B：法务咨询（无合同文本） ----
+        print("\n  --- 用例 B：法务咨询 ---")
+        tB = time.time()
+        queryB = "劳动法对加班费是怎么规定的？"
+        routeB = route_intent(queryB, contract_text=None)
+        print(f"  🧭 has_contract={routeB['has_contract']} skills={routeB['skills']}")
+
+        stateB = {
+            "conversation_id": "test-conv-B",
+            "user_id": "test-user",
+            "scene": "legal",
+            "query": queryB,
+            "contract_text": None,
+            "history": "",
+            "has_contract": routeB["has_contract"],
+            "route_skills": routeB["skills"],
+            "tool_history": [],
+            "skill_outputs": {},
+            "status": "running",
+            "guard_issues": [],
+            "guard_retry": 0,
+        }
+        resultB = await graph.ainvoke(stateB)
+        print(f"  ✅ 法务咨询完成 ({time.time() - tB:.1f}s)")
+        print(f"  📄 final_answer 前 300 字: {(resultB.get('final_answer') or '')[:300]}...")
+        print(f"  📄 skill_outputs keys: {list((resultB.get('skill_outputs') or {}).keys())}")
+        print(f"  📄 law_context 非空: {bool(resultB.get('law_context'))}")
 
     except Exception as e:
-        print(f"  ❌ 合同审查失败: {e}")
-        import traceback
-        traceback.print_exc()
-
-    print("\n" + "=" * 60)
-    print("Phase 7: 测试研究型任务图 (LangGraph)")
-    print("=" * 60)
-    t0 = time.time()
-    try:
-        from workflows import create_research_agent_graph
-
-        research_graph = create_research_agent_graph(llm, retrieval_service, guardrails)
-
-        state = {
-            "query": "劳动法对加班费是怎么规定的？",
-            "history": "",
-            "tool_history": [],
-            "search_results": [],
-            "policy_flags": [],
-            "status": "running",
-        }
-
-        result = await research_graph.ainvoke(state)
-        print(f"  ✅ 研究型任务完成 ({time.time() - t0:.1f}s)")
-        print(f"  📄 状态: {result.get('status')}")
-        print(f"  📄 计划: {result.get('plan')}")
-        print(f"  📄 答案前 300 字: {result.get('final_answer', '')[:300]}...")
-
-    except Exception as e:
-        print(f"  ❌ 研究型任务失败: {e}")
+        print(f"  ❌ 统一法务图测试失败: {e}")
         import traceback
         traceback.print_exc()
 
