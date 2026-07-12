@@ -42,18 +42,14 @@ import jieba
 
 from config import AppConfig
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from langchain_community.retrievers import BM25Retriever
 try:
     from langchain.retrievers import EnsembleRetriever
 except ImportError:
     from langchain_classic.retrievers import EnsembleRetriever
-try:
-    from langchain_experimental.chat_models import ChatLlamaCpp
-except ImportError:
-    from langchain_community.chat_models import ChatLlamaCpp
-
 from utils import RerankService, RetrievalService
+from utils.embeddings import TransformerEmbeddings
+from utils.llm_factory import create_chat_llm, describe_llm_backend, llm_supports_parallel_requests
 from utils.guardrails import GuardrailsPipeline
 from utils.intent_router import route_intent
 from workflows import build_legal_graph, SkillSpec
@@ -283,10 +279,11 @@ def check_completion(state: dict) -> dict:
 def build_components(config: AppConfig):
     """构建最小组件集，不加载 MySQL/Redis。返回 (llm, retrieval_service, embeddings)。"""
     print("📦 加载 Embedding...")
-    embeddings = HuggingFaceBgeEmbeddings(
+    embeddings = TransformerEmbeddings(
         model_name=config.embedding.model_name,
-        model_kwargs={'device': config.embedding.device, 'local_files_only': True},
-        encode_kwargs={'normalize_embeddings': config.embedding.normalize_embeddings}
+        device=config.embedding.device,
+        normalize_embeddings=config.embedding.normalize_embeddings,
+        local_files_only=True,
     )
 
     print("📦 加载 Reranker...")
@@ -323,21 +320,14 @@ def build_components(config: AppConfig):
         hyde_enabled=config.retrieval.hyde_enabled,
     )
 
-    print(f"📦 加载 LLM: {config.llm.model_path}...")
-    llm = ChatLlamaCpp(
-        model_path=config.llm.model_path,
-        n_gpu_layers=config.llm.n_gpu_layers,
-        n_ctx=config.llm.n_ctx,
-        temperature=config.llm.temperature,
-        verbose=False,
-        streaming=False,
-    )
+    print(f"📦 初始化 LLM 后端: {describe_llm_backend(config.llm)}...")
+    llm = create_chat_llm(config.llm, streaming=False)
     print("✅ 所有组件加载完成")
 
     return llm, retrieval_service, embeddings
 
 
-def build_graph(llm, retrieval_service, embeddings):
+def build_graph(llm, retrieval_service, embeddings, llm_config):
     """
     用已加载的组件构建统一法务图（与 workflow_service.py 的接线对齐）。
 
@@ -352,10 +342,12 @@ def build_graph(llm, retrieval_service, embeddings):
 
     # 直接构造 skill_specs（{name: SkillSpec(fn, uses_law_context, label)}），
     # uses_law_context 全部 False，label 用中文（与 WorkflowService 注册一致）。
+    # 本地 ChatLlamaCpp 模式下 LLM-backed specialists 加锁；server 模式交给推理服务排队/调度。
+    llm_bound = not llm_supports_parallel_requests(llm_config)
     skill_specs = {
-        "risk_clause_detector": SkillSpec(risk_clause_skill, False, "合同风险条款"),
-        "compliance_check": SkillSpec(compliance_skill, False, "合规检查"),
-        "legal_term_explainer": SkillSpec(legal_term_skill, False, "术语解释"),
+        "risk_clause_detector": SkillSpec(risk_clause_skill, False, "合同风险条款", llm_bound=llm_bound),
+        "compliance_check": SkillSpec(compliance_skill, False, "合规检查", llm_bound=llm_bound),
+        "legal_term_explainer": SkillSpec(legal_term_skill, False, "术语解释", llm_bound=llm_bound),
         "statute_checker": SkillSpec(statute_skill, False, "时效计算"),
         "case_retriever": SkillSpec(case_retriever_skill, False, "相似案例"),
     }
@@ -396,11 +388,35 @@ async def run_case(graph, case: dict) -> dict:
     completion = check_completion(result)
     relevance = compute_answer_relevance(result.get("final_answer", ""), case["ground_truth"])
 
+    skill_outputs = result.get("skill_outputs", {}) or {}
+    specialist_reports = result.get("specialist_reports", {}) or {}
+    specialist_corrections = result.get("specialist_corrections", []) or []
+    specialist_validation_errors = result.get("specialist_validation_errors", []) or []
+    routed = route["skills"]
+    specialist_coverage = (len([s for s in routed if s in skill_outputs]) / len(routed)) if routed else 1.0
+
+    final_answer = result.get("final_answer", "") or ""
     return {
-        "final_answer": result.get("final_answer", "")[:500],
+        "final_answer": final_answer[:500],
+        "final_answer_full": final_answer,
+        "ground_truth": case.get("ground_truth", ""),
+        "contract_text": case.get("contract_text", ""),
+        "law_context": result.get("law_context", ""),
+        "evidence_items": result.get("evidence_items", []),
         "has_contract": route["has_contract"],
-        "route_skills": route["skills"],
+        "route_skills": routed,
+        "skill_outputs": skill_outputs,
+        "specialist_reports": specialist_reports,
+        "specialist_corrections": specialist_corrections,
+        "specialist_validation_errors": specialist_validation_errors,
+        "tool_history": result.get("tool_history", []),
+        "guard_issues": result.get("guard_issues", []),
         "tool_chain": tool_check,
+        "specialist_metrics": {
+            "coverage": round(specialist_coverage, 4),
+            "correction_count": len(specialist_corrections),
+            "validation_error_count": len(specialist_validation_errors),
+        },
         "completion": completion,
         "answer_relevance": round(relevance, 4),
         "latency": round(latency, 2),
@@ -422,7 +438,7 @@ def main():
     print(f"统一法务图全链路评估（retrieve → run_skills → generate → guard）")
     print(f"{'='*60}")
 
-    graph = build_graph(llm, retrieval_service, embeddings)
+    graph = build_graph(llm, retrieval_service, embeddings, config.llm)
 
     dataset = ALL_EVAL_DATASET[:args.limit] if args.limit > 0 else ALL_EVAL_DATASET
     results = []
@@ -435,15 +451,20 @@ def main():
         completed = result.get("completion", {}).get("completed", False)
         status_icon = "✅" if completed else "❌"
         tool_cov = result.get("tool_chain", {}).get("coverage", 0)
+        specialist_cov = result.get("specialist_metrics", {}).get("coverage", 0)
         print(f"    {status_icon} completion={completed}  "
-              f"relevance={result['answer_relevance']:.2f}  "
+              f"relevance={result.get('answer_relevance', 0):.2f}  "
               f"tool_cov={tool_cov:.2f}  "
+              f"specialist_cov={specialist_cov:.2f}  "
               f"latency={result['latency']:.1f}s")
 
     # 汇总
     completed = sum(1 for r in results if r.get("completion", {}).get("completed"))
-    avg_relevance = sum(r["answer_relevance"] for r in results) / len(results)
+    avg_relevance = sum(r.get("answer_relevance", 0) for r in results) / len(results)
     avg_tool_cov = sum(r.get("tool_chain", {}).get("coverage", 0) for r in results) / len(results)
+    avg_specialist_cov = sum(r.get("specialist_metrics", {}).get("coverage", 0) for r in results) / len(results)
+    specialist_correction_count = sum(r.get("specialist_metrics", {}).get("correction_count", 0) for r in results)
+    specialist_error_count = sum(r.get("specialist_metrics", {}).get("validation_error_count", 0) for r in results)
     avg_latency = sum(r["latency"] for r in results) / len(results)
     errors = [r for r in results if "error" in r]
 
@@ -452,6 +473,9 @@ def main():
         "completion_rate": round(completed / len(results), 4),
         "avg_answer_relevance": round(avg_relevance, 4),
         "avg_tool_chain_coverage": round(avg_tool_cov, 4),
+        "avg_specialist_coverage": round(avg_specialist_cov, 4),
+        "specialist_correction_count": specialist_correction_count,
+        "specialist_error_count": specialist_error_count,
         "avg_latency_s": round(avg_latency, 2),
         "errors": len(errors),
     }

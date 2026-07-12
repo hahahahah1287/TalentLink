@@ -364,10 +364,34 @@ def test_intent_router():
     check("合同+案例同时挂 case_retriever", "case_retriever" in r9["skills"], f"{r9}")
 
 
-# ==================== 8. 确定性 Guard 节点逻辑 ====================
+# ==================== 8. 外部检索官方来源白名单 ====================
+
+def test_web_search_evidence_policy():
+    print("\n[8] 外部检索 官方来源白名单 / URL evidence")
+    from skills.web_search import _is_trusted_official_domain, _normalize_result
+
+    check("gov.cn 子域名可信", _is_trusted_official_domain("https://www.mohrss.gov.cn/xxgk2020/"))
+    check("伪 gov.cn 后缀不可信", not _is_trusted_official_domain("https://www.mohrss.gov.cn.evil.example/a"))
+
+    item = _normalize_result(
+        {
+            "title": "最低工资标准",
+            "link": "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/",
+            "snippet": "官方发布摘要",
+        },
+        "最低工资标准",
+        "2026-07-08T00:00:00+00:00",
+    )
+    check("官方结果标记 trusted", item["trusted"] is True, f"item={item}")
+    check("外部证据带 URL", item["source_kind"] == "external_url" and bool(item["url"]), f"item={item}")
+    check("外部证据带 content_hash", bool(item.get("content_hash")), f"item={item}")
+    check("外部证据声明白名单版本", item.get("whitelist_version") == "official-cn-web-v1", f"item={item}")
+
+
+# ==================== 9. 确定性 Guard 节点逻辑 ====================
 
 def test_guard_logic():
-    print("\n[8] 确定性 Guard 引用校验 / 免责声明 / revise 触发")
+    print("\n[9] 确定性 Guard 引用校验 / 免责声明 / revise 触发")
     import asyncio
     from utils.guardrails import GuardrailsPipeline, CitationGuard
     from workflows.legal_graph import make_guard_node, check_guard_result
@@ -432,6 +456,7 @@ def main():
     test_case_retrieval_math()
     test_data_assets()
     test_intent_router()
+    test_web_search_evidence_policy()
     test_guard_logic()
 
     print("\n" + "=" * 60)

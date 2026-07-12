@@ -12,7 +12,7 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from langchain_core.documents import Document
 
@@ -64,6 +64,25 @@ _LAW_TITLE_ALIASES = {
     "labor_law": ("劳动法", "中华人民共和国劳动法", "labor_law"),
     "中华人民共和国劳动法": ("劳动法", "中华人民共和国劳动法", "labor_law"),
     "劳动法": ("劳动法", "中华人民共和国劳动法", "labor_law"),
+    "labor_contract_law": ("劳动合同法", "中华人民共和国劳动合同法", "labor_contract_law"),
+    "labor_law_contaract": ("劳动合同法", "中华人民共和国劳动合同法", "labor_contract_law"),
+    "中华人民共和国劳动合同法": ("劳动合同法", "中华人民共和国劳动合同法", "labor_contract_law"),
+    "劳动合同法": ("劳动合同法", "中华人民共和国劳动合同法", "labor_contract_law"),
+    "labor_dispute_mediation_arbitration_law": (
+        "劳动争议调解仲裁法", "中华人民共和国劳动争议调解仲裁法", "labor_dispute_mediation_arbitration_law"
+    ),
+    "中华人民共和国劳动争议调解仲裁法": (
+        "劳动争议调解仲裁法", "中华人民共和国劳动争议调解仲裁法", "labor_dispute_mediation_arbitration_law"
+    ),
+    "劳动争议调解仲裁法": (
+        "劳动争议调解仲裁法", "中华人民共和国劳动争议调解仲裁法", "labor_dispute_mediation_arbitration_law"
+    ),
+    "work_injury_insurance_regulations": ("工伤保险条例", "工伤保险条例", "work_injury_insurance_regulations"),
+    "work_related_injury": ("工伤保险条例", "工伤保险条例", "work_injury_insurance_regulations"),
+    "工伤保险条例": ("工伤保险条例", "工伤保险条例", "work_injury_insurance_regulations"),
+    "paid_annual_leave_regulations": ("职工带薪年休假条例", "职工带薪年休假条例", "paid_annual_leave_regulations"),
+    "Paid_Annual_Leave": ("职工带薪年休假条例", "职工带薪年休假条例", "paid_annual_leave_regulations"),
+    "职工带薪年休假条例": ("职工带薪年休假条例", "职工带薪年休假条例", "paid_annual_leave_regulations"),
 }
 
 
@@ -131,8 +150,11 @@ def normalize_law_title(raw_title: str = "", source_path: str = "") -> Dict[str,
     title = (raw_title or "").strip()
     basename = os.path.splitext(os.path.basename(source_path or ""))[0]
     key = title or basename
-    if basename == "labor_law" or key in _LAW_TITLE_ALIASES:
-        short, canonical, slug = _LAW_TITLE_ALIASES.get(key, _LAW_TITLE_ALIASES["labor_law"])
+    if basename in _LAW_TITLE_ALIASES:
+        short, canonical, slug = _LAW_TITLE_ALIASES[basename]
+        return {"law_title": short, "canonical_law_title": canonical, "law_slug": slug}
+    if key in _LAW_TITLE_ALIASES:
+        short, canonical, slug = _LAW_TITLE_ALIASES[key]
         return {"law_title": short, "canonical_law_title": canonical, "law_slug": slug}
 
     canonical = title or basename or "未知法律"
@@ -244,6 +266,23 @@ def evidence_article_numbers(evidence_items: List[Dict[str, Any]]) -> set:
             if normalized is not None:
                 numbers.add(normalized)
     return numbers
+
+
+def evidence_law_article_pairs(evidence_items: List[Dict[str, Any]]) -> Set[Tuple[str, int]]:
+    """Return allowed (law title alias, article number) pairs for citation validation."""
+    pairs: Set[Tuple[str, int]] = set()
+    for item in evidence_items or []:
+        source = item.get("source", {}) or {}
+        number = source.get("article_number")
+        if not isinstance(number, int):
+            number = normalize_article_number(number)
+        if number is None:
+            continue
+        for key in ("law_title", "canonical_law_title"):
+            title = source.get(key)
+            if title:
+                pairs.add((title, number))
+    return pairs
 
 
 def evidence_citations(evidence_items: List[Dict[str, Any]]) -> List[str]:

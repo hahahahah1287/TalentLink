@@ -26,12 +26,7 @@ import traceback
 from typing import Optional
 
 from langchain_core.documents import Document
-try:
-    from langchain_experimental.chat_models import ChatLlamaCpp
-except ImportError:
-    from langchain_community.chat_models import ChatLlamaCpp
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from langchain_community.retrievers import BM25Retriever
 try:
     from langchain.retrievers import EnsembleRetriever
@@ -46,10 +41,12 @@ from utils import (
     WorkflowCheckpoint,
     GuardrailsPipeline,
     PromptInjectionDetector,
-    parse_legal_document,
     annotate_documents,
 )
+from utils.legal_corpus import corpus_fingerprint, parse_legal_corpus, resolve_knowledge_base_paths
+from utils.embeddings import TransformerEmbeddings
 from utils.intent_router import route_intent
+from utils.llm_factory import create_chat_llm, describe_llm_backend, llm_supports_parallel_requests
 from utils.tools.contract_tools import create_contract_chain, create_legal_qa_chain
 from memory import ChatHistoryManager
 from workflows import build_legal_graph, SkillSpec
@@ -67,6 +64,7 @@ from skills.compliance_check import compliance_skill, init_skill as init_complia
 from skills.legal_term_explainer import legal_term_skill, init_skill as init_term_skill
 from skills.statute_checker import statute_skill
 from skills.case_retriever import case_retriever_skill, init_skill as init_case_skill
+from skills.web_search import web_search_skill
 
 
 def _sse(payload: dict) -> str:
@@ -80,23 +78,17 @@ class WorkflowService:
     def __init__(self, config: Optional[AppConfig] = None):
         self.config = config or AppConfig()
 
-        # --- 1. 加载 LLM（仅用于合成 / HyDE / 摘要，不做编排决策） ---
-        print(f"📦 [WorkflowService] 加载模型: {self.config.llm.model_path}...")
-        self.llm = ChatLlamaCpp(
-            model_path=self.config.llm.model_path,
-            n_gpu_layers=self.config.llm.n_gpu_layers,
-            n_ctx=self.config.llm.n_ctx,
-            temperature=self.config.llm.temperature,
-            verbose=self.config.llm.verbose,
-            streaming=True,
-        )
+        # --- 1. 初始化 LLM 客户端（仅用于合成 / HyDE / 摘要，不做编排决策） ---
+        print(f"📦 [WorkflowService] 初始化 LLM 后端: {describe_llm_backend(self.config.llm)}...")
+        self.llm = create_chat_llm(self.config.llm, streaming=True)
 
         # --- 2. 加载 Embedding ---
         print(f"📦 [WorkflowService] 加载 Embedding...")
-        self.embeddings = HuggingFaceBgeEmbeddings(
+        self.embeddings = TransformerEmbeddings(
             model_name=self.config.embedding.model_name,
-            model_kwargs={'device': self.config.embedding.device},
-            encode_kwargs={'normalize_embeddings': self.config.embedding.normalize_embeddings}
+            device=self.config.embedding.device,
+            normalize_embeddings=self.config.embedding.normalize_embeddings,
+            local_files_only=True,
         )
 
         # --- 3. 加载 Reranker ---
@@ -193,15 +185,26 @@ class WorkflowService:
             "相似案例检索（语义检索 + MMR 多样性）",
             uses_law_context=False, label="相似案例",
         )
+        self.registry.register(
+            "web_search", web_search_skill,
+            "最新政策/地方标准外部检索（仅作 freshness 线索）",
+            uses_law_context=False, label="外部 freshness 检索",
+        )
         print(f"📦 [WorkflowService] 已注册 {len(self.registry)} 个 skills: {self.registry}")
 
         # --- 10. 组装 SkillSpec 表 + 法务节点（SSE 真流式直接驱动节点） ---
         self.guardrails = GuardrailsPipeline()
+        llm_bound_skills = set() if llm_supports_parallel_requests(self.config.llm) else {
+            "risk_clause_detector",
+            "compliance_check",
+            "legal_term_explainer",
+        }
         skill_specs = {
             name: SkillSpec(
                 fn=self.registry.get_skill_fn(name),
                 uses_law_context=self.registry.uses_law_context(name),
                 label=self.registry.get_label(name),
+                llm_bound=name in llm_bound_skills,
             )
             for name in self.registry.get_all_skill_names()
         }
@@ -229,12 +232,13 @@ class WorkflowService:
 
     def _setup_hybrid_retriever(self):
         """初始化混合检索器（BM25 + FAISS）。"""
-        knowledge_path = self.config.retrieval.knowledge_base_path
+        knowledge_paths = resolve_knowledge_base_paths(self.config.retrieval)
+        corpus_id = corpus_fingerprint(knowledge_paths)
         index_path = self.config.retrieval.faiss_index_path
         metadata_index_path = index_path + "_with_metadata"
 
-        if not os.path.exists(knowledge_path):
-            print(f"⚠️ [Retriever] 知识库文件不存在: {knowledge_path}，使用占位文档")
+        if not knowledge_paths:
+            print("⚠️ [Retriever] 未找到知识库文件，使用占位文档")
             docs = [Document(page_content="暂无法律数据")]
             vector_store = FAISS.from_documents(docs, self.embeddings)
         elif os.path.exists(metadata_index_path):
@@ -247,11 +251,12 @@ class WorkflowService:
             docs = list(vector_store.docstore._dict.values())
             print(f"📄 [Retriever] 从索引恢复 {len(docs)} 个条款文档")
         else:
-            print(f"📄 [Retriever] 结构化解析法律文档...")
-            with open(knowledge_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-            docs = parse_legal_document(text, source=knowledge_path)
-            print(f"✅ [Retriever] 已解析为 {len(docs)} 个条款")
+            print(f"📄 [Retriever] 结构化解析法律文档: {knowledge_paths}")
+            docs = parse_legal_corpus(knowledge_paths)
+            for doc in docs:
+                doc.metadata["corpus_version"] = self.config.retrieval.corpus_version
+                doc.metadata["corpus_fingerprint"] = corpus_id
+            print(f"✅ [Retriever] 已解析为 {len(docs)} 个条款，corpus_fingerprint={corpus_id}")
             print(f"🤖 [Retriever] 开始元数据标注（共 {len(docs)} 个条款）...")
             docs = annotate_documents(docs, self.llm)
             print(f"✅ [Retriever] 元数据标注完成")
@@ -273,6 +278,7 @@ class WorkflowService:
     def _build_cache_fingerprint(self, query: str, contract_text: Optional[str], route: dict) -> dict:
         """构建结果缓存指纹，避免同 query 不同合同/路由串答案。"""
         contract_hash = hashlib.sha256((contract_text or "").encode("utf-8")).hexdigest()[:16]
+        knowledge_paths = resolve_knowledge_base_paths(self.config.retrieval)
         return {
             "query": query,
             "contract_hash": contract_hash,
@@ -280,7 +286,11 @@ class WorkflowService:
             "route_skills": route.get("skills", []),
             "model_path": self.config.llm.model_path,
             "faiss_index_path": self.config.retrieval.faiss_index_path,
-            "workflow_version": "legal-dag-evidence-v1",
+            "corpus_version": self.config.retrieval.corpus_version,
+            "corpus_fingerprint": corpus_fingerprint(knowledge_paths),
+            "knowledge_base_paths": knowledge_paths,
+            "route_version": route.get("route_version"),
+            "workflow_version": "legal-dag-evidence-v2",
             "guard_version": "evidence-citation-v1",
         }
 
@@ -367,7 +377,16 @@ class WorkflowService:
             "history": history_str,
             "has_contract": route["has_contract"],
             "route_skills": route["skills"],
-            "tool_history": [],
+            "route_result": route,
+            "tool_history": [{
+                "step": "route",
+                "tool": "intent_router",
+                "route_version": route.get("route_version"),
+                "confidence": route.get("confidence"),
+                "skills": route.get("skills"),
+                "trace": route.get("trace"),
+                "timestamp": time.time(),
+            }],
             "skill_outputs": {},
             "status": "running",
             "guard_issues": [],
@@ -420,11 +439,12 @@ class WorkflowService:
 
         Yields: ("status", str) | ("token", str) | ("final", state)
         """
-        # --- 阶段 A：检索 + skill（确定性，无需流式） ---
+        # --- 阶段 A：检索 + 并行 specialist agents（确定性，无需流式） ---
         yield ("status", "检索法条…" if not state["has_contract"] else "审查合同（检索→风险/合规）…")
 
         upd = await self._retrieve_node(state)
         state.update(upd)
+        yield ("status", "正在并行运行法务专家分析…")
         upd = await self._run_skills_node(state)
         state.update(upd)
 

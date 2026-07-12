@@ -15,9 +15,11 @@
 """
 import re
 import logging
-from typing import Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 logger = logging.getLogger(__name__)
+
+ROUTE_VERSION = "deterministic-router-v3"
 
 
 # ==================== 加权关键词表（v2 核心升级） ====================
@@ -81,6 +83,13 @@ SKILL_WEIGHTED_KEYWORDS: Dict[str, List[tuple]] = {
         ("这样行吗", 1.5), ("有问题吗", 1.5), ("算违法吗", 2.5),
         ("受法律保护", 1.5), ("合理吗", 1.5), ("正常吗", 1.0),
     ],
+    "web_search": [
+        # 只给最新/地方/政策类问题触发，不让主链路默认联网
+        ("最新", 3.0), ("现行", 2.5), ("今年", 2.0), ("202", 1.5),
+        ("地方政策", 3.0), ("地方标准", 3.0), ("当地", 2.0),
+        ("最低工资标准", 3.0), ("社保基数", 3.0), ("公积金基数", 3.0),
+        ("最新政策", 3.0), ("政策更新", 3.0), ("新规", 2.5),
+    ],
 }
 
 # 各 skill 触发阈值（得分 >= 此值即触发）
@@ -89,6 +98,7 @@ SKILL_THRESHOLDS: Dict[str, float] = {
     "legal_term_explainer": 2.5,
     "case_retriever": 2.0,
     "compliance_check": 2.0,
+    "web_search": 4.0,
 }
 
 # 向后兼容：旧 SKILL_KEYWORDS 格式（供已有导入不报错）
@@ -153,6 +163,10 @@ class RouteResult(TypedDict):
     contract_source: str        # "content" | "field" | "both" | "none"
     matched: Dict[str, List[str]]  # 每个 skill 命中的关键词（调试）
     scores: Dict[str, float]    # v2 新增：每个 skill 的加权得分
+    route_version: str
+    confidence: float
+    confidence_by_skill: Dict[str, float]
+    trace: List[Dict[str, Any]]
 
 
 # 合同场景固定挂载的 skill
@@ -225,6 +239,8 @@ def route_intent(query: str, contract_text: Optional[str] = None) -> RouteResult
 
     matched: Dict[str, List[str]] = {}
     scores: Dict[str, float] = {}
+    confidence_by_skill: Dict[str, float] = {}
+    trace: List[Dict[str, Any]] = []
     skills: List[str] = []
 
     def _add(name: str):
@@ -238,13 +254,30 @@ def route_intent(query: str, contract_text: Optional[str] = None) -> RouteResult
         if hits:
             matched[name] = hits
         threshold = SKILL_THRESHOLDS.get(name, 2.0)
+        confidence_by_skill[name] = round(min(score / threshold, 1.0), 4) if threshold else 0.0
+        trace.append({
+            "stage": "skill_score",
+            "skill": name,
+            "score": round(score, 2),
+            "threshold": threshold,
+            "hits": hits,
+            "triggered": score >= threshold,
+        })
         if score >= threshold:
             triggered_skills.append(name)
 
     if has_contract:
         # 合同场景：固定挂风险条款 + 合规，再加 query 额外触发的 skill
+        trace.append({
+            "stage": "contract_detect",
+            "source": contract_source,
+            "query_score": contract_feature_score(q),
+            "contract_text_score": contract_feature_score(contract_text or ""),
+            "triggered": True,
+        })
         for s in _CONTRACT_SKILLS:
             _add(s)
+            confidence_by_skill[s] = max(confidence_by_skill.get(s, 0.0), 1.0)
         for s in triggered_skills:
             _add(s)
     else:
@@ -252,8 +285,18 @@ def route_intent(query: str, contract_text: Optional[str] = None) -> RouteResult
         for s in triggered_skills:
             _add(s)
         # 兜底：没触发具体 skill 但确实是法务问题 → compliance_check
-        if not skills and _match_keywords(q, LEGAL_FALLBACK_KEYWORDS):
+        fallback_hits = _match_keywords(q, LEGAL_FALLBACK_KEYWORDS)
+        if not skills and fallback_hits:
             _add("compliance_check")
+            confidence_by_skill["compliance_check"] = max(confidence_by_skill.get("compliance_check", 0.0), 0.55)
+            trace.append({
+                "stage": "legal_fallback",
+                "skill": "compliance_check",
+                "hits": fallback_hits,
+                "triggered": True,
+            })
+
+    confidence = round(max([confidence_by_skill.get(s, 0.0) for s in skills] or [0.0]), 4)
 
     # --- 3. 可观测性日志 ---
     logger.debug(
@@ -274,4 +317,8 @@ def route_intent(query: str, contract_text: Optional[str] = None) -> RouteResult
         contract_source=contract_source,
         matched=matched,
         scores=scores,
+        route_version=ROUTE_VERSION,
+        confidence=confidence,
+        confidence_by_skill=confidence_by_skill,
+        trace=trace,
     )

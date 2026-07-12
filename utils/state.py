@@ -41,6 +41,7 @@ class AppState(TypedDict, total=False):
     # === 意图路由（确定性关键词路由的输出） ===
     has_contract: bool      # 是否判定为合同审查场景（内容特征）
     route_skills: List[str] # 检索后、合成前要执行的确定性 skill 列表
+    route_result: Dict[str, Any]  # 路由版本、confidence、trace 等可观测信息
 
     # === 检索结果 ===
     retrieved_docs: List[Document]    # 本地知识库检索结果
@@ -54,8 +55,11 @@ class AppState(TypedDict, total=False):
     draft_answer: str
     final_answer: str
 
-    # === Skill 结构化输出 ===
-    skill_outputs: Dict[str, str]  # skill_name -> result（保留结构化数据）
+    # === Skill / Specialist 结构化输出 ===
+    skill_outputs: Dict[str, str]  # skill_name -> 清洗后的 skill-result-v1 JSON
+    specialist_reports: Dict[str, Any]  # specialist_name -> validation / correction report
+    specialist_corrections: List[Dict[str, Any]]  # 修复、剔除 finding 等审计记录
+    specialist_validation_errors: List[Dict[str, Any]]  # 结构校验错误记录
 
     # === 流程控制 ===
     status: str             # "running" | "done" | "error"

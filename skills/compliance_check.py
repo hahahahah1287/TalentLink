@@ -26,6 +26,8 @@ from langchain.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 
+from utils.skill_result import make_skill_result
+
 
 # ==================== 决策表加载 ====================
 
@@ -228,18 +230,54 @@ def init_skill(llm):
     _rules = load_rules()
 
 
-def _extract_facts(scenario: str) -> Dict[str, Any]:
-    """抽取结构化字段：优先 LLM，正则兜底补全"""
-    facts: Dict[str, Any] = {}
+def _extract_facts_with_provenance(scenario: str) -> tuple:
+    """抽取结构化字段，并记录 LLM/regex 来源、置信度与冲突。"""
+    llm_facts: Dict[str, Any] = {}
+    regex_facts = regex_extract(scenario)
+    errors: List[str] = []
     if _extract_chain is not None:
         try:
-            llm_facts = _extract_chain.invoke({"scenario": scenario})
-            if isinstance(llm_facts, dict):
-                facts.update({k: v for k, v in llm_facts.items() if v is not None})
+            extracted = _extract_chain.invoke({"scenario": scenario})
+            if isinstance(extracted, dict):
+                llm_facts = {k: v for k, v in extracted.items() if v is not None}
         except Exception as e:
+            errors.append(str(e))
             print(f"⚠️ [Compliance] LLM 抽取失败，回退正则: {e}")
-    for k, v in regex_extract(scenario).items():
-        facts.setdefault(k, v)
+
+    facts: Dict[str, Any] = {}
+    field_provenance: Dict[str, Any] = {}
+    for key in sorted(set(llm_facts) | set(regex_facts)):
+        llm_has = key in llm_facts
+        regex_has = key in regex_facts
+        conflict = llm_has and regex_has and llm_facts[key] != regex_facts[key]
+        if regex_has:
+            facts[key] = regex_facts[key]
+            source = "llm+regex" if llm_has and not conflict else "regex"
+            confidence = 0.95 if not conflict else 0.8
+        else:
+            facts[key] = llm_facts[key]
+            source = "llm"
+            confidence = 0.7
+        field_provenance[key] = {
+            "source": source,
+            "confidence": confidence,
+            "llm_value": llm_facts.get(key),
+            "regex_value": regex_facts.get(key),
+            "conflict": conflict,
+        }
+
+    provenance = {
+        "extractor": "llm+regex",
+        "field_provenance": field_provenance,
+        "llm_available": _extract_chain is not None,
+        "errors": errors,
+    }
+    return facts, provenance
+
+
+def _extract_facts(scenario: str) -> Dict[str, Any]:
+    """Backward-compatible facts-only extractor."""
+    facts, _ = _extract_facts_with_provenance(scenario)
     return facts
 
 
@@ -260,10 +298,38 @@ def compliance_check(scenario: str, law_context: str = "") -> str:
         return json.dumps({"error": "场景描述为空"}, ensure_ascii=False)
 
     rules = _rules or load_rules()
-    facts = _extract_facts(scenario)
+    facts, provenance = _extract_facts_with_provenance(scenario)
     result = evaluate_compliance(facts, rules)
     result["extracted_facts"] = facts
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    result["extraction_provenance"] = provenance
+    findings = [
+        {**item, "finding_type": "compliance_violation"}
+        for item in result.get("violations", [])
+    ]
+    unified = make_skill_result(
+        skill_name="compliance_check",
+        facts=facts,
+        findings=findings,
+        evidence=[
+            {
+                "source_kind": "skill_basis",
+                "rule_id": item.get("rule_id"),
+                "legal_basis": item.get("legal_basis"),
+            }
+            for item in result.get("violations", [])
+            if item.get("legal_basis")
+        ],
+        provenance={"extraction": provenance},
+        display_text=result.get("overall_status", ""),
+        metrics={
+            "coverage": result.get("coverage"),
+            "evaluated_rules": result.get("evaluated_rules"),
+            "total_rules": result.get("total_rules"),
+            "violations": len(result.get("violations", [])),
+        },
+        legacy=result,
+    )
+    return json.dumps(unified, ensure_ascii=False, indent=2)
 
 
 def compliance_skill(query: str, law_context: str = "") -> str:

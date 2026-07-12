@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from workflows.legal_graph import build_legal_graph, SkillSpec
 from utils.guardrails import GuardrailsPipeline
+from utils.skill_result import make_skill_result, parse_skill_result
 import workflows.legal_graph as lg
 
 
@@ -32,7 +33,15 @@ class StubRetrieval:
 
 def fake_skill(q, lc=""):
     return json.dumps(
-        {"ok": True, "input_len": len(q), "used_law": bool(lc)},
+        make_skill_result(
+            skill_name="stub_skill",
+            findings=[
+                {"type": "valid", "message": "结构化 finding 已生成"},
+                {"type": ""},
+            ],
+            display_text=f"input_len={len(q)}, used_law={bool(lc)}",
+            metrics={"input_len": len(q), "used_law": bool(lc)},
+        ),
         ensure_ascii=False,
     )
 
@@ -67,6 +76,14 @@ def main():
     assert fa, "final_answer is empty"
     assert out.get("skill_outputs"), "no skills ran"
     assert out.get("law_context"), "law_context not retrieved"
+
+    cleaned = parse_skill_result(out["skill_outputs"]["compliance_check"])
+    assert cleaned["skill_name"] == "compliance_check", "specialist name was not normalized"
+    assert len(cleaned.get("findings", [])) == 1, "malformed finding was not dropped"
+    assert out.get("specialist_reports"), "missing specialist reports"
+    assert out.get("specialist_corrections"), "missing specialist correction audit"
+    assert any(c.get("action") == "drop_finding" for c in out["specialist_corrections"]), "drop_finding correction not recorded"
+    print("specialist corrections:", out.get("specialist_corrections"))
     print("--- graph e2e (stub) OK ---")
 
 

@@ -24,6 +24,8 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 from langchain.tools import tool
 
+from utils.skill_result import make_skill_result
+
 
 # ==================== 案例库加载 ====================
 
@@ -302,7 +304,26 @@ def case_retriever(query: str) -> str:
             {"error": "skill 未初始化，请先调用 init_skill(embeddings)"},
             ensure_ascii=False,
         )
-    return _retriever.retrieve_as_string(query)
+    cases = _retriever.retrieve(query, top_k=3)
+    display_text = _retriever.retrieve_as_string(query, top_k=3)
+    unified = make_skill_result(
+        skill_name="case_retriever",
+        findings=[{**case, "finding_type": "similar_case"} for case in cases],
+        evidence=[
+            {
+                "source_kind": "case_reference",
+                "case_id": case.get("id"),
+                "articles": case.get("articles", []),
+                "score": case.get("_final_score"),
+            }
+            for case in cases
+        ],
+        provenance={"retriever": "bge+element_boost+mmr", "data_source": _CASE_DB_PATH},
+        display_text=display_text,
+        metrics={"top_k": len(cases), "mmr_lambda": _retriever.mmr_lambda},
+        legacy={"cases": cases, "disclaimer": _retriever.meta.get("disclaimer", "")},
+    )
+    return json.dumps(unified, ensure_ascii=False, indent=2)
 
 
 def case_retriever_skill(query: str, law_context: str = "") -> str:

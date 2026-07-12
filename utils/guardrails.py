@@ -16,7 +16,12 @@ import re
 from typing import List, Optional, Callable
 from dataclasses import dataclass, field
 
-from utils.evidence import evidence_article_numbers, evidence_citations, evidence_law_titles
+from utils.evidence import (
+    evidence_article_numbers,
+    evidence_citations,
+    evidence_law_article_pairs,
+    evidence_law_titles,
+)
 
 
 @dataclass
@@ -227,6 +232,9 @@ class CitationGuard(BaseGuard):
     # 提取中文数字条文号：第三十八条、第十二条
     ARTICLE_CN_PATTERN = re.compile(r'第([一二三四五六七八九十百千零]+)条')
 
+    # 提取带法律名的完整引用： 《劳动法》第21条 / 《劳动法》第二十一条
+    LAW_ARTICLE_PATTERN = re.compile(r'《([^》]+)》\s*第\s*([一二三四五六七八九十百千零\d]+)\s*条')
+
     # 中文数字 → 阿拉伯数字映射
     CN_NUM_MAP = {
         '零': 0, '一': 1, '二': 2, '三': 3, '四': 4,
@@ -265,6 +273,18 @@ class CitationGuard(BaseGuard):
             articles.add(cls._cn_to_arabic(cn_num))
         return articles
 
+    @classmethod
+    def _extract_law_article_pairs(cls, text: str) -> set:
+        """Extract explicit (law title, article number) citation pairs from output text."""
+        pairs = set()
+        for law_name, article in cls.LAW_ARTICLE_PATTERN.findall(text or ""):
+            if article.isdigit():
+                article_num = int(article)
+            else:
+                article_num = cls._cn_to_arabic(article)
+            pairs.add((law_name, article_num))
+        return pairs
+
     def process(self, text: str, context: Optional[dict] = None) -> GuardResult:
         context = context or {}
         law_context = context.get("law_context", "")
@@ -284,6 +304,8 @@ class CitationGuard(BaseGuard):
             allowed_articles = evidence_article_numbers(evidence_items)
             allowed_citations = evidence_citations(evidence_items)
             allowed_laws = evidence_law_titles(evidence_items)
+            allowed_pairs = evidence_law_article_pairs(evidence_items)
+            explicit_pairs = self._extract_law_article_pairs(text)
             if cited_laws and allowed_laws:
                 missing_laws = []
                 for law_name in cited_laws:
@@ -293,9 +315,21 @@ class CitationGuard(BaseGuard):
                     warnings.append(
                         f"以下法律未在本轮证据集中找到：{'、'.join(missing_laws)}"
                     )
+            if explicit_pairs and allowed_pairs:
+                missing_pairs = []
+                for law_name, article_num in explicit_pairs:
+                    if (law_name, article_num) not in allowed_pairs:
+                        missing_pairs.append(f"《{law_name}》第{article_num}条")
+                if missing_pairs:
+                    allowed_text = "、".join(allowed_citations) or "本轮检索证据"
+                    warnings.append(
+                        f"以下法律-条文组合未在本轮证据集中找到：{'、'.join(missing_pairs)}；允许引用：{allowed_text}"
+                    )
             if cited_articles:
+                explicit_article_nums = {num for _law, num in explicit_pairs}
+                articles_to_check = cited_articles - explicit_article_nums if explicit_pairs else cited_articles
                 missing = []
-                for article_num in cited_articles:
+                for article_num in articles_to_check:
                     if article_num not in allowed_articles:
                         missing.append(f"第{article_num}条")
                 if missing:

@@ -36,6 +36,11 @@ from utils.retrieval_service import RetrievalService
 from utils.tools.contract_tools import create_contract_chain, create_legal_qa_chain
 from utils.guardrails import GuardrailsPipeline
 from utils.evidence import extract_skill_evidence, render_skill_evidence
+from utils.skill_result import (
+    normalize_skill_result,
+    render_skill_result_for_prompt,
+    validate_and_clean_skill_result,
+)
 
 
 # ==================== skill 调度声明 ====================
@@ -48,12 +53,13 @@ from utils.evidence import extract_skill_evidence, render_skill_evidence
 # 该表在 build_legal_graph 时由调用方注入（skill 已 init），这里只定义结构。
 
 class SkillSpec:
-    __slots__ = ("fn", "uses_law_context", "label")
+    __slots__ = ("fn", "uses_law_context", "label", "llm_bound")
 
-    def __init__(self, fn: Callable[..., str], uses_law_context: bool, label: str):
+    def __init__(self, fn: Callable[..., str], uses_law_context: bool, label: str, llm_bound: bool = False):
         self.fn = fn
         self.uses_law_context = uses_law_context
         self.label = label
+        self.llm_bound = llm_bound
 
 
 # ==================== 节点：检索（固化为首节点） ====================
@@ -98,16 +104,19 @@ def make_retrieve_node(retrieval_service: RetrievalService):
     return retrieve
 
 
-# ==================== 节点：确定性 skill 执行 ====================
+# ==================== 节点：并行 Specialist Agents 执行 ====================
 
 def make_run_skills_node(skill_specs: Dict[str, SkillSpec]):
     """
-    按路由结果（state["route_skills"]）确定性地调用 0~N 个 skill。
+    按路由结果（state["route_skills"]）确定性地调用 0~N 个 specialist agent。
 
-    - 合同场景下，run_skills 的输入优先用 contract_text（风险条款抽取要看合同全文），
-      其余 skill 用 query。
-    - 消费法条的 skill 把 law_context 透传进去（修 M11）。
-    - 每个 skill 用 to_thread 卸载（内部可能有 LLM 抽取/embedding），失败隔离不影响其它。
+    这里的 specialist agent 是受控专家单元：固定输入、固定 skill、统一输出 schema，
+    并在进入 generate 前做结构化校验与清洗。它不是自由 LLM Planner。
+
+    - 合同场景下，risk/compliance specialist 的输入优先用 contract_text。
+    - 消费法条的 specialist 把 law_context 透传进去（修 M11）。
+    - 每个 specialist 用 to_thread 卸载，并通过 asyncio.gather 并行执行。
+    - 单个 specialist 失败隔离，错误也会规范化为 skill-result-v1，便于审计/评测。
     """
 
     async def run_skills(state: AppState) -> Dict[str, Any]:
@@ -119,6 +128,7 @@ def make_run_skills_node(skill_specs: Dict[str, SkillSpec]):
         contract_text = state.get("contract_text") or ""
         law_context = state.get("law_context", "")
         has_contract = state.get("has_contract", False)
+        llm_lock = asyncio.Lock()
 
         async def _run_one(name: str):
             spec = skill_specs.get(name)
@@ -134,30 +144,68 @@ def make_run_skills_node(skill_specs: Dict[str, SkillSpec]):
                 skill_input = query
             lc = law_context if spec.uses_law_context else ""
             try:
-                out = await asyncio.to_thread(spec.fn, skill_input, lc)
+                if spec.llm_bound:
+                    async with llm_lock:
+                        out = await asyncio.to_thread(spec.fn, skill_input, lc)
+                else:
+                    out = await asyncio.to_thread(spec.fn, skill_input, lc)
                 return name, out
-            except Exception as e:  # 单个 skill 失败隔离
-                print(f"⚠️ [Legal:run_skills] skill {name} 执行失败: {e}")
-                return name, json.dumps({"error": str(e), "skill": name}, ensure_ascii=False)
+            except Exception as e:  # 单个 specialist 失败隔离
+                print(f"⚠️ [Legal:run_skills] specialist {name} 执行失败: {e}")
+                return name, json.dumps({
+                    "schema_version": "skill-result-v1",
+                    "skill_name": name,
+                    "status": "error",
+                    "facts": {},
+                    "findings": [],
+                    "evidence": [],
+                    "provenance": {"error": str(e)},
+                    "display_text": f"{name} 执行失败：{e}",
+                    "metrics": {},
+                }, ensure_ascii=False)
 
         results = await asyncio.gather(*[_run_one(s) for s in skills])
 
         skill_outputs = dict(state.get("skill_outputs", {}))
+        specialist_reports = dict(state.get("specialist_reports", {}))
+        specialist_corrections = list(state.get("specialist_corrections", []))
+        specialist_validation_errors = list(state.get("specialist_validation_errors", []))
         history_entries = []
         for name, out in results:
             if out is None:
                 continue
-            skill_outputs[name] = out
+
+            normalized = normalize_skill_result(name, out)
+            cleaned, report = validate_and_clean_skill_result(normalized)
+            clean_output = json.dumps(cleaned, ensure_ascii=False)
+
+            skill_outputs[name] = clean_output
+            specialist_reports[name] = report
+            for correction in report.get("corrections", []):
+                specialist_corrections.append({"specialist": name, **correction})
+            for dropped in report.get("dropped_findings", []):
+                specialist_corrections.append({"specialist": name, "action": "drop_finding", **dropped})
+            for err in report.get("validation_errors", []):
+                specialist_validation_errors.append({"specialist": name, "error": err})
+
             history_entries.append({
-                "step": f"skill_{name}",
+                "step": f"specialist_{name}",
                 "tool": name,
-                "output_len": len(out),
+                "output_len": len(clean_output),
+                "status": report.get("status", "ok"),
+                "correction_count": len(report.get("corrections", [])) + len(report.get("dropped_findings", [])),
                 "timestamp": time.time(),
             })
-            print(f"⚡ [Legal:run_skills] {name} 完成（{len(out)} 字）")
+            print(
+                f"⚡ [Legal:run_skills] specialist {name} 完成"
+                f"（{len(clean_output)} 字，修正/剔除 {history_entries[-1]['correction_count']} 项）"
+            )
 
         return {
             "skill_outputs": skill_outputs,
+            "specialist_reports": specialist_reports,
+            "specialist_corrections": specialist_corrections,
+            "specialist_validation_errors": specialist_validation_errors,
             "tool_history": state.get("tool_history", []) + history_entries,
         }
 
@@ -175,7 +223,8 @@ def _format_skill_findings(state: AppState, skill_specs: Dict[str, SkillSpec]) -
     skill_evidence = []
     for name, raw in outputs.items():
         label = skill_specs[name].label if name in skill_specs else name
-        parts.append(f"【{label}（确定性分析结果）】\n{raw}")
+        rendered = render_skill_result_for_prompt(name, raw)
+        parts.append(f"【{label}（确定性分析结果）】\n{rendered}")
         skill_evidence.extend(extract_skill_evidence(name, raw))
     evidence_text = render_skill_evidence(skill_evidence)
     if evidence_text:

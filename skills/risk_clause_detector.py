@@ -24,6 +24,8 @@ from langchain.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 
+from utils.skill_result import make_skill_result
+
 
 # ==================== 规则引擎（确定性核心，可单测） ====================
 #
@@ -351,23 +353,57 @@ def init_skill(llm):
     _extract_chain = create_extract_chain(llm)
 
 
-def _extract_facts(contract_text: str) -> Dict[str, Any]:
+def _extract_facts_with_provenance(contract_text: str) -> tuple:
     """
-    抽取结构化字段：优先 LLM，失败回退正则，并与正则结果合并补全。
+    抽取结构化字段，并记录每个字段来自 LLM / regex / 冲突合并的 provenance。
     """
-    facts: Dict[str, Any] = {}
+    llm_facts: Dict[str, Any] = {}
+    regex_facts = regex_extract(contract_text)
+    errors: List[str] = []
     if _extract_chain is not None:
         try:
-            llm_facts = _extract_chain.invoke({"contract_text": contract_text})
-            if isinstance(llm_facts, dict):
-                facts.update({k: v for k, v in llm_facts.items() if v is not None})
+            extracted = _extract_chain.invoke({"contract_text": contract_text})
+            if isinstance(extracted, dict):
+                llm_facts = {k: v for k, v in extracted.items() if v is not None}
         except Exception as e:
+            errors.append(str(e))
             print(f"⚠️ [RiskClause] LLM 抽取失败，回退正则: {e}")
 
-    # 正则兜底：补全 LLM 没抽到的字段（不覆盖 LLM 已有结果）
-    regex_facts = regex_extract(contract_text)
-    for k, v in regex_facts.items():
-        facts.setdefault(k, v)
+    facts: Dict[str, Any] = {}
+    field_provenance: Dict[str, Any] = {}
+    for key in sorted(set(llm_facts) | set(regex_facts)):
+        llm_has = key in llm_facts
+        regex_has = key in regex_facts
+        conflict = llm_has and regex_has and llm_facts[key] != regex_facts[key]
+        if regex_has:
+            # 确定性规则抽取优先，避免 LLM 和明确文本冲突时吞掉硬证据。
+            facts[key] = regex_facts[key]
+            source = "llm+regex" if llm_has and not conflict else "regex"
+            confidence = 0.95 if not conflict else 0.8
+        else:
+            facts[key] = llm_facts[key]
+            source = "llm"
+            confidence = 0.7
+        field_provenance[key] = {
+            "source": source,
+            "confidence": confidence,
+            "llm_value": llm_facts.get(key),
+            "regex_value": regex_facts.get(key),
+            "conflict": conflict,
+        }
+
+    provenance = {
+        "extractor": "llm+regex",
+        "field_provenance": field_provenance,
+        "llm_available": _extract_chain is not None,
+        "errors": errors,
+    }
+    return facts, provenance
+
+
+def _extract_facts(contract_text: str) -> Dict[str, Any]:
+    """Backward-compatible facts-only extractor."""
+    facts, _ = _extract_facts_with_provenance(contract_text)
     return facts
 
 
@@ -387,10 +423,29 @@ def risk_clause_detector(contract_text: str, law_context: str = "") -> str:
     if not contract_text or not contract_text.strip():
         return json.dumps({"error": "合同文本为空"}, ensure_ascii=False)
 
-    facts = _extract_facts(contract_text)
+    facts, provenance = _extract_facts_with_provenance(contract_text)
     result = evaluate_rules(facts)
     result["extracted_facts"] = facts  # 暴露抽取结果，便于调试/可解释
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    result["extraction_provenance"] = provenance
+    findings = [
+        {**item, "finding_type": "risk_clause"}
+        for item in result.get("risk_clauses", [])
+    ]
+    unified = make_skill_result(
+        skill_name="risk_clause_detector",
+        facts=facts,
+        findings=findings,
+        evidence=[
+            {"source_kind": "skill_basis", "legal_basis": item.get("legal_basis")}
+            for item in result.get("risk_clauses", [])
+            if item.get("legal_basis")
+        ],
+        provenance={"extraction": provenance},
+        display_text=result.get("summary", {}).get("overall", ""),
+        metrics=result.get("summary", {}),
+        legacy=result,
+    )
+    return json.dumps(unified, ensure_ascii=False, indent=2)
 
 
 def risk_clause_skill(query: str, law_context: str = "") -> str:
